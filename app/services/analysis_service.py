@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+import statistics
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 
@@ -70,7 +71,7 @@ def _score_repo(repo: GitHubRepo, commit_count: int, six_months_ago: datetime) -
         score += 3.0                               # actively maintained
     if not repo.is_fork:
         score += 2.0                               # original work
-    type_bonus = {"OSS": 4.0, "production": 3.0, "research": 2.0, "infra": 1.5, "portfolio": 1.0}
+    type_bonus = {"OSS": 4.0, "production": 3.0, "project": 2.5, "research": 2.0, "infra": 1.5, "portfolio": 1.0}
     score += type_bonus.get(_classify_repo(repo, commit_count), 0.0)
     return score
 
@@ -95,7 +96,9 @@ def _classify_repo(repo: GitHubRepo, commit_count: int) -> str:
         return "production"
     if bool(all_words & _PORTFOLIO_WORDS):
         return "portfolio"
-    return "toy"
+    if not repo.is_fork and commit_count >= 5 and bool(repo.description):
+        return "project"
+    return "personal"
 
 
 def _classify_commit(message: str) -> str:
@@ -202,11 +205,15 @@ class AnalysisService:
         ))
 
         # ── Churn & commit size ────────────────────────────────────────────
-        churns = [c.additions + c.deletions for c in commits]
-        avg_churn = sum(churns) / (len(churns) or 1)
+        # Use median of human, source-touching commits to resist outliers and bots.
+        source_commits = [c for c in commits if not _is_bot_commit(c) and _touches_source(c)]
+        churn_values = [c.additions + c.deletions for c in source_commits]
+        if not churn_values:
+            churn_values = [c.additions + c.deletions for c in commits]
+        median_churn = statistics.median(churn_values) if churn_values else 0.0
         signals.append(Signal(
             name="avg_churn_per_commit",
-            value=round(min(avg_churn, 2000.0), 1),
+            value=round(median_churn, 1),
             confidence=0.61,
             evidence_refs=commit_evidence,
             timeframe="sampled_recent",
@@ -424,7 +431,7 @@ class AnalysisService:
         repo_types: Counter[str] = Counter(
             _classify_repo(r, commit_counts.get(r.name, 0)) for r in own_repos
         )
-        dominant_type = repo_types.most_common(1)[0][0] if repo_types else "toy"
+        dominant_type = repo_types.most_common(1)[0][0] if repo_types else "personal"
 
         signals.append(Signal(
             name="dominant_repo_type",
@@ -433,7 +440,7 @@ class AnalysisService:
             evidence_refs=repo_evidence,
             timeframe="all_time",
         ))
-        for label in ("production", "OSS", "toy", "research", "infra", "hackathon", "coursework", "portfolio"):
+        for label in ("production", "OSS", "project", "personal", "research", "infra", "hackathon", "coursework", "portfolio"):
             count = repo_types.get(label, 0)
             signals.append(Signal(
                 name=f"{label}_repo_count",
@@ -560,31 +567,45 @@ class AnalysisService:
 
         scores: dict[str, float] = {
             "ML Experimenter": ml_bias * 2.0 + (0.4 if primary_lang == "Python" else 0.0) + min(research_count * 0.1, 0.3),
-            "Systems Builder": systems_bias * 2.0 + (0.3 if primary_lang in systems_langs else 0.0) + (0.1 if trajectory == "stable" else 0.0),
-            "Infra Tinkerer": infra_bias * 2.0 + type_counts["infra"] / total + min(repo_types.get("infra", 0) * 0.15, 0.4),
+            # Systems Builder absorbs infra signal so every archetype maps to a template
+            "Systems Builder": systems_bias * 2.0 + infra_bias * 1.0 + (0.3 if primary_lang in systems_langs else 0.0) + (0.1 if trajectory == "stable" else 0.0) + type_counts["infra"] / total * 0.5 + min(repo_types.get("infra", 0) * 0.1, 0.3),
             # entropy and lang_shifted both boost Full-stack Generalist
             "Full-stack Generalist": (0.3 if (lang_counts.keys() & frontend_langs) and (lang_counts.keys() & backend_langs) else 0.0) + (0.15 if lang_shifted else 0.0) + (language_diversity * 0.04) + min(entropy_val_score * 0.05, 0.15),
-            "Tooling Specialist": tooling_bias * 1.5 + (0.2 if primary_lang in {"Go", "Rust", "Python"} else 0.0),
-            "Research Hacker": (0.3 if primary_lang == "Python" else 0.0) + type_counts["docs"] / total + min(research_count * 0.2, 0.5),
+            "Tooling Developer": tooling_bias * 1.5 + (0.2 if primary_lang in {"Go", "Rust", "Python"} else 0.0),
+            "Academic Researcher": (0.3 if primary_lang == "Python" else 0.0) + type_counts["docs"] / total + min(research_count * 0.2, 0.5),
             # review_bonus + dominance_bonus boost OSS Maintainer (ranks #1 and #2 signals)
             "OSS Maintainer": (0.4 if avg_stars > 5 else 0.0) + type_counts["fix"] / total * 0.5 + oss_pr_score + fork_ratio * 0.3 + min(oss_count * 0.15, 0.5) + (0.2 if months_active >= 8 and has_oss_evidence else 0.0) + review_bonus + dominance_bonus,
             # weekday_commit_ratio > 0.8 suggests professional engineer
             "Product Engineer": type_counts["feat"] / total * 0.8 + (0.3 if max_stars > 10 else 0.0) + min(production_count * 0.1, 0.4) + (0.2 if trajectory == "growing" else 0.0) + (0.15 if streak >= 3 else 0.0) + (0.15 if weekday_commit_ratio > 0.8 else 0.0),
             # low weekday ratio (weekend/hobby coding) boosts Hobbyist
-            "Hobbyist Explorer": (0.5 if dominant_type == "toy" else 0.0) + min(len(own_repos) / 30.0, 0.3) + (language_diversity * 0.05) + (0.2 if trajectory in {"growing", "burst"} else 0.0) + (0.1 if months_active >= 6 else 0.0) + (0.1 if weekday_commit_ratio < 0.4 else 0.0) + min(entropy_val_score * 0.03, 0.09),
+            "Hobbyist Explorer": (0.5 if dominant_type == "personal" else 0.0) + min(len(own_repos) / 30.0, 0.3) + (language_diversity * 0.05) + (0.2 if trajectory in {"growing", "burst"} else 0.0) + (0.1 if months_active >= 6 else 0.0) + (0.1 if weekday_commit_ratio < 0.4 else 0.0) + min(entropy_val_score * 0.03, 0.09),
         }
 
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
         top_archetype, top_score = ranked[0]
-        alternates = [name for name, _ in ranked[1:3]]
-        archetype_confidence = min(round(top_score / max(sum(scores.values()), 0.01), 2), 0.92)
-        archetype_confidence = max(archetype_confidence, 0.40)
+        second_score = ranked[1][1] if len(ranked) > 1 else 0.0
+
+        # Separation-based confidence: how decisively top beats second place
+        if top_score + second_score > 0:
+            archetype_confidence = round(min(top_score / (top_score + second_score), 0.95), 2)
+        else:
+            archetype_confidence = 0.5
+
+        # Thin data cap: few repos or commits means we can't be very confident
+        thin_data = len([r for r in repos if not r.is_fork]) < 3 or len(commits) < 5
+        if thin_data:
+            archetype_confidence = min(archetype_confidence, 0.55)
+
+        # Only show alternates that are meaningfully close (≥85% of top score)
+        threshold = top_score * 0.85
+        alternates = [name for name, score in ranked[1:4] if score >= threshold]
 
         archetype = ArchetypeResult(
             top_archetype=top_archetype,
             alternates=alternates,
             confidence=archetype_confidence,
             supporting_evidence=repo_evidence + commit_evidence[:2],
+            limited_data=thin_data,
         )
 
         scored = sorted(

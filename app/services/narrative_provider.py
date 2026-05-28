@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 
 from app.models.contracts import ArchetypeResult, HonestyMode, ReadmeResult, ReadmeSection, ReportResult, Signal
@@ -29,7 +31,6 @@ _BANNED_PHRASES = [
     "best practices",
     "hard worker",
     "dedicated professional",
-    # Additional phrases from research on authentic developer profiles
     "strong foundation",
     "years of experience",
     "love solving",
@@ -41,6 +42,18 @@ _BANNED_PHRASES = [
     "full-stack developer with",
     "software engineer with",
 ]
+
+# JSON schema for structured output (used by Gemini response_schema)
+_NARRATIVE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "readme_markdown": {"type": "string"},
+        "summary": {"type": "string"},
+        "standout_repos": {"type": "array", "items": {"type": "string"}},
+        "timeline": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["readme_markdown", "summary", "standout_repos", "timeline"],
+}
 
 # ── System prompt ────────────────────────────────────────────────────────────
 
@@ -59,7 +72,7 @@ profile without changing, rewrite it. Every sentence must be exclusively true of
    - Trajectory: what question or problem threads through their work; what they've been figuring out
    - Evidence: specific falsifiable things — repo names, star counts, commit patterns, PR counts
    - Signal: what they're working toward or exploring now (trajectory, language shifts, active direction)
-6. GitHub-flavored markdown that renders cleanly on a profile page.
+6. GitHub-flavored markdown that renders cleanly on a profile page. Use ## headers for sections.
 7. Under 600 words total.
 
 BAD (generic — falsifiability fails — could describe anyone):
@@ -232,9 +245,6 @@ _DEFAULT_TEMPLATE = {
 }
 
 # ── Signal → authentic framing hints ─────────────────────────────────────────
-# Translates raw data patterns into authentic narrative language.
-# Research finding: "infer the specific question the developer has been trying to answer,
-# then frame their profile around that question."
 
 _SIGNAL_FRAMING: dict[str, str] = {
     "high_depth_low_breadth": "works in depth, not breadth — tends to stay with a problem until it's resolved",
@@ -249,6 +259,40 @@ _SIGNAL_FRAMING: dict[str, str] = {
     "declining_trajectory": "activity has pulled back — worth noting without over-interpreting",
     "consistent_cadence": "shows up regularly — not sprint-and-disappear",
 }
+
+
+_README_MIN_LEN = 50
+
+
+def _extract_json(raw: str) -> dict:
+    """Extract a JSON object from LLM output, handling fences and surrounding prose."""
+    s = raw.strip()
+    if s.startswith("```"):
+        newline = s.find("\n")
+        s = s[newline + 1:] if newline != -1 else s[3:]
+        if "```" in s:
+            s = s.rsplit("```", 1)[0]
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"No JSON object found in LLM output: {raw[:120]!r}")
+    try:
+        return json.loads(s[start:end + 1])
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"JSON parse error: {exc}") from exc
+
+
+def _generate_with_retry(generate_fn, prompt: str, max_attempts: int = 2) -> str:
+    """Call generate_fn up to max_attempts times, sleeping 0.5s between attempts."""
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return generate_fn(prompt)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)
+    raise last_exc  # type: ignore[misc]
 
 
 # ── Signal narration ──────────────────────────────────────────────────────────
@@ -268,7 +312,6 @@ def _narrate_signals(signals: list[Signal]) -> list[str]:
     sm = {s.name: s for s in signals}
     sentences: list[str] = []
 
-    # Commit mix
     feat = _fv(sm, "feature_ratio")
     fix = _fv(sm, "fix_ratio")
     ref = _fv(sm, "refactor_ratio")
@@ -307,7 +350,6 @@ def _narrate_signals(signals: list[Signal]) -> list[str]:
     elif cpw > 0:
         sentences.append(f"Measured cadence — {cpw:.2f} commits/week.")
 
-    # Stars / impact
     max_stars = _fv(sm, "max_stars")
     avg_stars = _fv(sm, "avg_stars")
     if max_stars > 50000:
@@ -319,7 +361,6 @@ def _narrate_signals(signals: list[Signal]) -> list[str]:
     if avg_stars > 500 and max_stars > 0:
         sentences.append(f"Average {avg_stars:,.0f} stars across repos — consistently visible work.")
 
-    # Language
     lang = _sv(sm, "primary_language")
     diversity = _fv(sm, "language_diversity")
     recent_lang = _sv(sm, "recent_primary_language")
@@ -339,7 +380,6 @@ def _narrate_signals(signals: list[Signal]) -> list[str]:
             f"{_SIGNAL_FRAMING['language_shift']}."
         )
 
-    # Repo character
     fork_ratio = _fv(sm, "fork_ratio")
     repo_count = _fv(sm, "repo_count")
     pr_count = _fv(sm, "pr_authored_count")
@@ -357,7 +397,6 @@ def _narrate_signals(signals: list[Signal]) -> list[str]:
     elif pr_count > 20:
         sentences.append(f"Active contributor — {int(pr_count)} PRs authored.")
 
-    # Temporal
     months = _fv(sm, "months_active_last_year")
     trajectory = _sv(sm, "activity_trajectory")
 
@@ -393,17 +432,28 @@ def _build_combined_prompt(prompt: NarrativePrompt) -> str:
         ref.excerpt for ref in prompt.archetype.supporting_evidence
         if ref.source_type == "commit" and ref.excerpt
     ][:4]
-    top_repos = prompt.standout_repos[:5] or [
-        ref.source_id for ref in prompt.archetype.supporting_evidence
-        if ref.source_type == "repo"
-    ][:5]
+
+    # Use detailed repo cards if available, else fall back to names
+    if prompt.repo_details:
+        top_repos_block = "\n".join(
+            f"  - {r.name}"
+            + (f": {r.description}" if r.description else "")
+            + (f" [{r.language}]" if r.language else "")
+            + (f" ⭐{r.stars:,}" if r.stars > 0 else "")
+            for r in prompt.repo_details[:5]
+        )
+    else:
+        top_repos = prompt.standout_repos[:5] or [
+            ref.source_id for ref in prompt.archetype.supporting_evidence
+            if ref.source_type == "repo"
+        ][:5]
+        top_repos_block = "\n".join(f"  - {r}" for r in top_repos)
 
     commit_block = (
         "\n".join(f'  "{e}"' for e in commit_excerpts)
         if commit_excerpts else "  (no commit excerpts available)"
     )
 
-    # Detect applicable signal framing hints
     fork_ratio = _fv(sm, "fork_ratio")
     churn = _fv(sm, "avg_churn_per_commit")
     repo_count = _fv(sm, "repo_count")
@@ -425,28 +475,32 @@ def _build_combined_prompt(prompt: NarrativePrompt) -> str:
         + "\n".join(f"- {h}" for h in framing_hints)
     ) if framing_hints else ""
 
+    limited_note = (
+        "\nNOTE: Limited data (few repos/commits) — acknowledge uncertainty rather than overstating confidence.\n"
+    ) if prompt.archetype.limited_data else ""
+
     return f"""Generate a GitHub profile README and analysis report for @{prompt.username}.
 
 ARCHETYPE: {prompt.archetype.top_archetype} (confidence: {prompt.archetype.confidence:.0%})
-Secondary archetypes: {', '.join(prompt.archetype.alternates) or 'none'}
-
+{f"Secondary archetypes: {', '.join(prompt.archetype.alternates)}" if prompt.archetype.alternates else "No close secondary archetypes — commit to this identity."}
+{limited_note}
 ARCHETYPE FRAMING (how to approach this particular developer identity):
 {template['framing']}
 
-FOUR-BEAT STRUCTURE — use this sequence:
+FOUR-BEAT STRUCTURE — use this sequence with ## headers:
 1. Anchor — one specific sentence: who they are right now, grounded in domain + evidence
 2. Trajectory — the thread through their work: what question or problem they've been figuring out
 3. Evidence — specific falsifiable things: repo names, star counts, commit patterns, PR counts
-4. Signal — what they're working toward or currently exploring: trajectory, language shifts, active direction
+4. Signal — what they're working toward or currently exploring
 
 Falsifiability test: every sentence must be exclusively true of THIS developer.
-If a sentence could be pasted onto another profile unchanged, rewrite it.
 
 SIGNAL NARRATIVE (interpret these as facts about the developer):
 {chr(10).join(f'- {s}' for s in narrative)}
 {framing_block}
 
-TOP REPOSITORIES: {top_repos}
+TOP REPOSITORIES (use these names and descriptions in the README):
+{top_repos_block}
 
 COMMIT VOICE — actual messages from their work (let this inform tone and specificity):
 {commit_block}
@@ -458,19 +512,22 @@ README GUIDANCE: {template['lead']}
 Suggested sections: {', '.join(template['sections'])}
 Emphasise: {template['emphasis']}
 
-Return ONLY valid JSON with no markdown fences:
-{{
-  "readme_markdown": "<full README markdown, under 600 words, starts with # {prompt.username}>",
-  "summary": "<2-sentence grounded summary of this developer's engineering identity>",
-  "standout_repos": ["<repo1>", "<repo2>", "<repo3>"],
-  "timeline": [
-    "<observation about their work pattern>",
-    "<observation about recent trajectory>"
-  ]
-}}"""
+Return a JSON object with these exact fields:
+- readme_markdown: full README markdown, under 600 words, starts with # {prompt.username}, uses ## for sections
+- summary: 2-sentence grounded summary of this developer's engineering identity
+- standout_repos: list of 3 repo names from the top repositories above
+- timeline: list of 2 observations about their work pattern and recent trajectory"""
 
 
 # ── Data class ────────────────────────────────────────────────────────────────
+
+@dataclass
+class RepoCard:
+    name: str
+    description: str
+    language: str
+    stars: int
+
 
 @dataclass
 class NarrativePrompt:
@@ -479,12 +536,15 @@ class NarrativePrompt:
     signals: list[Signal]
     archetype: ArchetypeResult
     standout_repos: list[str] = field(default_factory=list)
+    repo_details: list[RepoCard] = field(default_factory=list)
 
 
 def anti_generic_guard(text: str) -> str:
     cleaned = text
     for phrase in _BANNED_PHRASES:
         cleaned = cleaned.replace(phrase, "")
+    cleaned = re.sub(r" {2,}", " ", cleaned)
+    cleaned = re.sub(r" +([.,;:!?])", r"\1", cleaned)
     return cleaned
 
 
@@ -494,7 +554,6 @@ class NarrativeProvider:
     def build_both(self, prompt: NarrativePrompt) -> tuple[ReadmeResult, ReportResult]:
         raise NotImplementedError
 
-    # Convenience shims kept for backward-compat with tests
     def build_readme(self, prompt: NarrativePrompt) -> ReadmeResult:
         return self.build_both(prompt)[0]
 
@@ -505,7 +564,7 @@ class NarrativeProvider:
 # ── Gemini provider ───────────────────────────────────────────────────────────
 
 class GeminiNarrativeProvider(NarrativeProvider):
-    def __init__(self, api_key: str, model: str = "gemini-2.0-flash-lite") -> None:
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash") -> None:
         from google import genai  # type: ignore[import-untyped]
         self._client = genai.Client(api_key=api_key)
         self._model = model
@@ -519,24 +578,25 @@ class GeminiNarrativeProvider(NarrativeProvider):
             config=types.GenerateContentConfig(
                 system_instruction=_SYSTEM_PROMPT,
                 temperature=0.7,
-                max_output_tokens=1500,
+                max_output_tokens=2000,
+                response_mime_type="application/json",
+                response_schema=_NARRATIVE_JSON_SCHEMA,
             ),
         )
         return response.text or ""
 
     def build_both(self, prompt: NarrativePrompt) -> tuple[ReadmeResult, ReportResult]:
-        top_repos = prompt.standout_repos[:3] or [
+        top_repos = [r.name for r in prompt.repo_details[:3]] or prompt.standout_repos[:3] or [
             ref.source_id for ref in prompt.archetype.supporting_evidence
             if ref.source_type == "repo"
         ][:3]
         try:
-            raw = self._generate(_build_combined_prompt(prompt))
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            data = json.loads(raw)
-
+            raw = _generate_with_retry(self._generate, _build_combined_prompt(prompt))
+            data = _extract_json(raw)
             markdown = anti_generic_guard(data.get("readme_markdown", ""))
+            if not markdown.strip() or len(markdown.strip()) < _README_MIN_LEN:
+                logger.warning("Gemini readme too short/empty (len=%d), falling back", len(markdown.strip()))
+                return self._fallback.build_both(prompt)
             readme = ReadmeResult(
                 markdown=markdown,
                 sections=[ReadmeSection(
@@ -544,6 +604,7 @@ class GeminiNarrativeProvider(NarrativeProvider):
                     content=markdown,
                     evidence_refs=prompt.archetype.supporting_evidence,
                 )],
+                generator=self._model,
             )
             report = ReportResult(
                 summary=anti_generic_guard(data.get("summary", "")),
@@ -552,8 +613,8 @@ class GeminiNarrativeProvider(NarrativeProvider):
                 timeline=data.get("timeline", []),
             )
             return readme, report
-        except Exception:
-            logger.exception("Gemini generation failed, falling back to deterministic")
+        except Exception as exc:
+            logger.warning("Gemini generation failed (%s), falling back to deterministic", exc)
             return self._fallback.build_both(prompt)
 
 
@@ -581,24 +642,26 @@ class OpenAICompatibleNarrativeProvider(NarrativeProvider):
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                "max_tokens": 1500,
+                "max_tokens": 2000,
                 "temperature": 0.7,
+                "response_format": {"type": "json_object"},
             },
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"] or ""
 
     def build_both(self, prompt: NarrativePrompt) -> tuple[ReadmeResult, ReportResult]:
-        top_repos = prompt.standout_repos[:3] or [
+        top_repos = [r.name for r in prompt.repo_details[:3]] or prompt.standout_repos[:3] or [
             ref.source_id for ref in prompt.archetype.supporting_evidence
             if ref.source_type == "repo"
         ][:3]
         try:
-            raw = self._generate(_build_combined_prompt(prompt)).strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
-            data = json.loads(raw)
+            raw = _generate_with_retry(self._generate, _build_combined_prompt(prompt))
+            data = _extract_json(raw)
             markdown = anti_generic_guard(data.get("readme_markdown", ""))
+            if not markdown.strip() or len(markdown.strip()) < _README_MIN_LEN:
+                logger.warning("%s readme too short/empty, falling back to deterministic", self._provider_name)
+                return self._fallback.build_both(prompt)
             readme = ReadmeResult(
                 markdown=markdown,
                 sections=[ReadmeSection(
@@ -606,6 +669,7 @@ class OpenAICompatibleNarrativeProvider(NarrativeProvider):
                     content=markdown,
                     evidence_refs=prompt.archetype.supporting_evidence,
                 )],
+                generator=f"{self._provider_name}/{self._model}",
             )
             report = ReportResult(
                 summary=anti_generic_guard(data.get("summary", "")),
@@ -614,46 +678,58 @@ class OpenAICompatibleNarrativeProvider(NarrativeProvider):
                 timeline=data.get("timeline", []),
             )
             return readme, report
-        except Exception:
-            logger.exception("%s generation failed, falling back to deterministic", self._provider_name)
+        except Exception as exc:
+            logger.warning("%s generation failed (%s), falling back to deterministic", self._provider_name, exc)
             return self._fallback.build_both(prompt)
 
 
 # ── Deterministic provider ────────────────────────────────────────────────────
 
 class DeterministicNarrativeProvider(NarrativeProvider):
-    """Fallback provider that generates narrative prose without an LLM.
+    """Fallback provider: multi-section, evidence-led README without an LLM.
 
-    Uses the four-beat structure (Anchor → Trajectory → Evidence → Signal) and
-    produces flowing paragraphs rather than bullet lists — closer to what a good
-    human-authored README looks like.
+    Leads with the single most impressive quantified fact, then uses archetype-
+    specific sections with repo cards (name + description), stack, and recent direction.
     """
 
     def build_both(self, prompt: NarrativePrompt) -> tuple[ReadmeResult, ReportResult]:
         sm = {s.name: s for s in prompt.signals}
         archetype = prompt.archetype.top_archetype
-        alternates = prompt.archetype.alternates[:2]
+        template = _ARCHETYPE_TEMPLATES.get(archetype, _DEFAULT_TEMPLATE)
 
         lines: list[str] = [f"# {prompt.username}", ""]
 
-        archetype_line = f"**{archetype}**"
-        if alternates:
-            archetype_line += f" · *also: {', '.join(alternates)}*"
-        lines += [archetype_line, ""]
+        # Opening: lead with the most impressive quantified fact
+        opening = _build_opening(archetype, sm, prompt.repo_details)
+        lines += [opening, ""]
 
-        # Beat 1 + 2: Anchor + Trajectory in a single intro paragraph
-        intro = _build_intro_paragraph(archetype, sm)
-        lines += [intro, ""]
+        # Standout work section with repo cards
+        work_section = _build_work_section(prompt.repo_details, template)
+        if work_section:
+            section_header = template["sections"][1] if len(template["sections"]) > 1 else "Work"
+            lines += [f"## {section_header}", ""]
+            lines += work_section
+            lines += [""]
 
-        # Beat 3: Evidence — commit patterns, repo character, contribution counts
-        evidence = _build_evidence_paragraph(sm, prompt.standout_repos)
+        # Stack section
+        stack = _build_stack_line(sm)
+        if stack:
+            lines += ["## Stack", "", stack, ""]
+
+        # Recent direction / signal beat
+        direction = _build_recent_direction(sm)
+        if direction:
+            lines += ["## Recently", "", direction, ""]
+
+        # Evidence beat: commit patterns in prose
+        evidence = _build_evidence_prose(sm)
         if evidence:
             lines += [evidence, ""]
 
-        # Beat 4: Signal — temporal patterns and trajectory
-        signal = _build_signal_paragraph(sm)
-        if signal:
-            lines += [signal, ""]
+        # Sampling disclaimer — once, honest, not repeated
+        repo_count = int(_fv(sm, "repo_count"))
+        if repo_count > 0:
+            lines.append(f"*Based on {repo_count} public repos and sampled commits.*")
 
         markdown = anti_generic_guard("\n".join(lines).rstrip())
         readme = ReadmeResult(
@@ -663,6 +739,7 @@ class DeterministicNarrativeProvider(NarrativeProvider):
                 content=markdown,
                 evidence_refs=prompt.archetype.supporting_evidence,
             )],
+            generator="deterministic",
         )
 
         lang = sm.get("primary_language")
@@ -692,7 +769,7 @@ class DeterministicNarrativeProvider(NarrativeProvider):
                 f"Activity runs at {cpw_str} (sampled).{traj_str}"
             ),
             archetype=prompt.archetype,
-            standout_repos=prompt.standout_repos[:3],
+            standout_repos=[r.name for r in prompt.repo_details[:3]] or prompt.standout_repos[:3],
             timeline=timeline,
         )
         return readme, report
@@ -700,153 +777,157 @@ class DeterministicNarrativeProvider(NarrativeProvider):
 
 # ── Deterministic prose builders ─────────────────────────────────────────────
 
-def _build_intro_paragraph(archetype: str, sm: dict) -> str:
-    """Anchor + Trajectory beats: identity and what threads through their work."""
-    lang = sm.get("primary_language")
-    lang_val = str(lang.value) if lang else "varied languages"
-    stars = sm.get("max_stars")
-    star_val = int(stars.value) if stars and isinstance(stars.value, (int, float)) else 0
-    trajectory = sm.get("activity_trajectory")
-    traj_val = str(trajectory.value) if trajectory else "stable"
-    dominant_type = sm.get("dominant_repo_type")
-    dominant_type_val = str(dominant_type.value) if dominant_type else ""
-    diversity = sm.get("language_diversity")
-    div_val = int(diversity.value) if diversity and isinstance(diversity.value, (int, float)) else 1
+def _build_opening(archetype: str, sm: dict, repo_details: list[RepoCard]) -> str:
+    """Lead with the single most impressive quantified fact, then anchor + trajectory."""
+    lang = _sv(sm, "primary_language") or "various languages"
+    star_val = int(_fv(sm, "max_stars"))
+    repo_count = int(_fv(sm, "repo_count"))
+    pr_count = int(_fv(sm, "pr_authored_count"))
+    diversity = int(_fv(sm, "language_diversity"))
+    trajectory = _sv(sm, "activity_trajectory") or "stable"
+    dominant_type = _sv(sm, "dominant_repo_type") or "personal"
 
-    star_phrase = ""
-    if star_val > 10000:
-        star_phrase = f" Work reaching {star_val:,} stars."
-    elif star_val > 1000:
-        star_phrase = f" One project at {star_val:,} stars."
+    # Find top starred repo name
+    top_repo_name = repo_details[0].name if repo_details else ""
 
+    # Pick the most impressive quantified fact to lead with
+    if star_val > 50000 and top_repo_name:
+        lead = f"{top_repo_name} has {star_val:,} stars."
+    elif star_val > 1000 and top_repo_name:
+        lead = f"Top project `{top_repo_name}` at {star_val:,} stars."
+    elif pr_count > 200:
+        lead = f"{pr_count:,} PRs authored across GitHub."
+    elif repo_count > 20:
+        lead = f"{repo_count} public repos"
+        if diversity > 3:
+            lead += f" across {diversity} languages"
+        lead += "."
+    else:
+        lead = ""
+
+    # Anchor: language + archetype character
     traj_phrase = {
         "growing": "Activity is picking up.",
         "declining": "Output has tapered off recently.",
         "stable": "Showing up consistently.",
         "new": "Just getting started.",
-        "inconsistent": "Working in bursts.",
-    }.get(traj_val, "")
+        "burst": "Active in bursts.",
+        "inactive": "",
+    }.get(trajectory, "")
 
-    if div_val > 4:
-        lang_phrase = f"{lang_val} is home base, though the portfolio spans {div_val} languages"
-    elif div_val > 2:
-        lang_phrase = f"Works primarily in {lang_val}, with {div_val} languages in the mix"
-    else:
-        lang_phrase = f"Works in {lang_val}"
-
-    if dominant_type_val == "toy" and star_val == 0:
-        character = "Most repos are explorations — each one an answer to a specific question."
-    elif dominant_type_val == "coursework":
-        character = "Portfolio centers on academic and coursework projects."
+    if dominant_type in ("personal",) and star_val == 0:
+        character = f"Works in {lang} — portfolio reads as experiments built to answer specific questions."
+    elif dominant_type == "coursework":
+        character = f"Works in {lang}. Portfolio centers on academic and coursework projects."
     elif archetype == "OSS Maintainer":
-        character = "Maintains projects others depend on."
+        character = f"Works in {lang}. Maintains projects others depend on."
     elif archetype == "Systems Builder":
-        character = "Builds the invisible layer."
+        character = f"Works in {lang}. Builds the invisible layer."
     elif archetype == "Hobbyist Explorer":
-        character = "Explores widely across many tools and domains."
+        if diversity > 3:
+            character = f"Explores across {diversity} languages — {lang} is home base."
+        else:
+            character = f"Works in {lang} — explores widely across many tools and domains."
+    elif archetype == "Academic Researcher":
+        character = f"Works in {lang}. Research-focused portfolio."
+    elif archetype == "Tooling Developer":
+        character = f"Works in {lang}. Builds tools that reduce friction for other developers."
     else:
-        character = f"{archetype} by pattern."
+        character = f"Works in {lang}."
 
-    parts = [f"{lang_phrase}.{star_phrase}", character]
-    if traj_phrase:
-        parts.append(traj_phrase)
-
-    return " ".join(p for p in parts if p)
+    parts = [p for p in [lead, character, traj_phrase] if p]
+    return " ".join(parts)
 
 
-def _build_evidence_paragraph(sm: dict, standout_repos: list[str]) -> str:
-    """Evidence beat: commit patterns, repo character, contribution counts in prose."""
+def _build_work_section(repo_details: list[RepoCard], template: dict) -> list[str]:
+    """Render repo cards with descriptions for the standout work section."""
+    if not repo_details:
+        return []
+    lines: list[str] = []
+    for repo in repo_details[:4]:
+        card = f"**{repo.name}**"
+        if repo.description:
+            card += f" — {repo.description}"
+        meta_parts: list[str] = []
+        if repo.language:
+            meta_parts.append(repo.language)
+        if repo.stars > 0:
+            meta_parts.append(f"⭐{repo.stars:,}")
+        if meta_parts:
+            card += f" *({', '.join(meta_parts)})*"
+        lines.append(card)
+        lines.append("")
+    return lines
+
+
+def _build_stack_line(sm: dict) -> str:
+    """Build a concise stack line from language signals."""
+    primary = _sv(sm, "primary_language")
+    recent = _sv(sm, "recent_primary_language")
+    diversity = int(_fv(sm, "language_diversity"))
+
+    if not primary:
+        return ""
+
+    parts = [primary]
+    if recent and recent != primary:
+        parts.append(f"{recent} (recent)")
+    if diversity > 2:
+        parts.append(f"+ {diversity - 1} other{'s' if diversity > 2 else ''}")
+    return " · ".join(parts)
+
+
+def _build_recent_direction(sm: dict) -> str:
+    """Signal beat: recent trajectory and language shifts."""
     parts: list[str] = []
 
-    feat = sm.get("feature_ratio")
-    fix = sm.get("fix_ratio")
-    ref = sm.get("refactor_ratio")
-    churn = sm.get("avg_churn_per_commit")
-    quality = sm.get("commit_message_quality")
-    fork_ratio = sm.get("fork_ratio")
-    repo_count = sm.get("repo_count")
-    pr_count = sm.get("pr_authored_count")
-    diversity = sm.get("language_diversity")
+    shifted = _fv(sm, "language_shifted")
+    recent_lang = _sv(sm, "recent_primary_language")
+    primary_lang = _sv(sm, "primary_language")
+    trajectory = _sv(sm, "activity_trajectory")
+    months = int(_fv(sm, "months_active_last_year"))
+    streak = int(_fv(sm, "streak_months"))
 
-    if feat and isinstance(feat.value, (int, float)):
-        f_val = float(feat.value)
-        fi_val = float(fix.value) if fix and isinstance(fix.value, (int, float)) else 0
-        r_val = float(ref.value) if ref and isinstance(ref.value, (int, float)) else 0
-        dominant_label, dominant_pct = max(
-            [("feature work", f_val), ("bug fixes", fi_val), ("refactoring", r_val)],
-            key=lambda x: x[1],
-        )
-        commit_str = f"Commits skew toward {dominant_label} ({dominant_pct:.0%})"
-        if churn and isinstance(churn.value, (int, float)):
-            c = float(churn.value)
-            if c > 500:
-                commit_str += f", landing in large batches (~{c:,.0f} lines each)"
-            elif c < 60:
-                commit_str += f", small and surgical (~{c:.0f} lines each)"
-        commit_str += "."
-        if quality and isinstance(quality.value, (int, float)) and float(quality.value) > 0.8:
-            commit_str += " Messages are descriptive."
-        parts.append(commit_str)
+    if shifted > 0 and recent_lang and primary_lang and recent_lang != primary_lang:
+        parts.append(f"Noticeably shifting toward **{recent_lang}** (from {primary_lang}).")
 
-    repo_parts: list[str] = []
-    if repo_count and isinstance(repo_count.value, (int, float)):
-        repo_parts.append(f"{int(repo_count.value)} public repos")
-    if diversity and isinstance(diversity.value, (int, float)) and int(diversity.value) > 2:
-        repo_parts.append(f"{int(diversity.value)} languages")
-    if fork_ratio and isinstance(fork_ratio.value, (int, float)):
-        fr = float(fork_ratio.value)
-        if fr < 0.15:
-            repo_parts.append("mostly original work")
-        elif fr > 0.6:
-            repo_parts.append(f"largely forks ({fr:.0%})")
+    if trajectory == "growing":
+        parts.append("Activity is accelerating.")
+    elif trajectory == "declining":
+        parts.append("Output has tapered recently.")
+    elif trajectory == "stable" and months >= 8:
+        parts.append(f"Consistent cadence — active {months}/12 months last year.")
 
-    if repo_parts:
-        parts.append(", ".join(repo_parts).capitalize() + ".")
-
-    if pr_count and isinstance(pr_count.value, (int, float)) and int(pr_count.value) > 5:
-        pr_val = int(pr_count.value)
-        if pr_val > 100:
-            parts.append(f"{pr_val:,} PRs authored across GitHub.")
-        else:
-            parts.append(f"{pr_val} PRs authored.")
-
-    if standout_repos:
-        parts.append("Standout: " + " · ".join(f"`{r}`" for r in standout_repos[:4]))
+    if streak >= 4 and not parts:
+        parts.append(f"{streak}-month active streak.")
 
     return " ".join(parts)
 
 
-def _build_signal_paragraph(sm: dict) -> str:
-    """Signal beat: temporal patterns, cadence, and current trajectory in prose."""
+def _build_evidence_prose(sm: dict) -> str:
+    """Evidence beat: commit patterns in prose form."""
     parts: list[str] = []
 
-    months = sm.get("months_active_last_year")
-    streak = sm.get("streak_months")
-    shifted = sm.get("language_shifted")
-    recent_lang = sm.get("recent_primary_language")
-    primary_lang = sm.get("primary_language")
-    cpw = sm.get("commits_per_week")
+    feat = _fv(sm, "feature_ratio")
+    fix = _fv(sm, "fix_ratio")
+    ref = _fv(sm, "refactor_ratio")
+    churn = _fv(sm, "avg_churn_per_commit")
+    pr_count = int(_fv(sm, "pr_authored_count"))
 
-    if months and isinstance(months.value, (int, float)):
-        m = int(months.value)
-        if m >= 10:
-            parts.append(f"Active {m}/12 months last year — year-round cadence.")
-        elif m >= 8:
-            parts.append(f"Active most of the year ({m}/12 months).")
-        elif m >= 5:
-            parts.append(f"Active roughly half the year ({m} months).")
-        elif m > 0:
-            parts.append(f"Sporadic — {m} months active in the last year.")
+    if feat + fix + ref > 0:
+        dominant_label, dominant_pct = max(
+            [("feature work", feat), ("bug fixes", fix), ("refactoring", ref)],
+            key=lambda x: x[1],
+        )
+        commit_str = f"Commits skew toward {dominant_label} ({dominant_pct:.0%})"
+        if churn > 500:
+            commit_str += f", landing in large batches (~{churn:,.0f} lines)"
+        elif churn > 0 and churn < 60:
+            commit_str += f", small and surgical (~{churn:.0f} lines)"
+        commit_str += "."
+        parts.append(commit_str)
 
-    if cpw and isinstance(cpw.value, (int, float)):
-        parts.append(f"~{float(cpw.value):.2f} commits/week (sampled).")
-
-    if streak and isinstance(streak.value, (int, float)) and int(streak.value) >= 3:
-        parts.append(f"{int(streak.value)}-month active streak in recent history.")
-
-    if (shifted and isinstance(shifted.value, (int, float)) and shifted.value > 0
-            and recent_lang and primary_lang
-            and str(recent_lang.value) != str(primary_lang.value)):
-        parts.append(f"Recent shift toward **{recent_lang.value}** (from {primary_lang.value}).")
+    if pr_count > 20:
+        parts.append(f"{pr_count:,} PRs authored." if pr_count > 100 else f"{pr_count} PRs authored.")
 
     return " ".join(parts)

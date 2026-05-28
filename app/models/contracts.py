@@ -81,6 +81,7 @@ class ArchetypeResult(BaseModel):
     alternates: list[str]
     confidence: float = Field(ge=0, le=1)
     supporting_evidence: list[EvidenceRef]
+    limited_data: bool = False
 
 
 class ReadmeSection(BaseModel):
@@ -92,6 +93,7 @@ class ReadmeSection(BaseModel):
 class ReadmeResult(BaseModel):
     markdown: str
     sections: list[ReadmeSection]
+    generator: str = "deterministic"
 
 
 class ReportResult(BaseModel):

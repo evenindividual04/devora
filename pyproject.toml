@@ -1,0 +1,39 @@
+[project]
+name = "github-profile-analyzer"
+version = "0.6.0"
+description = "GitHub identity-analysis and README generation API"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.30.0",
+  "pydantic>=2.8.0",
+  "pydantic-settings>=2.3.0",
+  "httpx>=0.27.0",
+  "sqlalchemy>=2.0.30",
+  "aiosqlite>=0.20.0",
+  "asyncpg>=0.29.0",
+  "redis>=5.0.7",
+  "alembic>=1.13.2",
+  "PyJWT>=2.9.0",
+  "passlib[bcrypt]>=1.7.4",
+  "cryptography>=43.0.1",
+  "google-genai>=1.0.0",
+  "email-validator>=2.0.0",
+  "greenlet>=3.5.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "pytest-asyncio>=0.23.0"
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

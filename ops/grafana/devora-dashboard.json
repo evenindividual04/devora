@@ -1,0 +1,29 @@
+{
+  "title": "Devora Backend",
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Queued vs Completed",
+      "targets": [
+        {"expr": "increase(devora_counter{name=\"analysis.queued\"}[5m])"},
+        {"expr": "increase(devora_counter{name=\"analysis.completed\"}[5m])"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Failed Jobs",
+      "targets": [
+        {"expr": "increase(devora_counter{name=\"analysis.failed\"}[5m])"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Average Analysis Duration (ms)",
+      "targets": [
+        {"expr": "devora_timer_avg_ms{name=\"analysis.duration_ms\"}"}
+      ]
+    }
+  ],
+  "schemaVersion": 39,
+  "version": 1
+}

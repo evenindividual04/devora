@@ -1,0 +1,25 @@
+# Python
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Local DB/state
+app.db
+*.sqlite
+*.sqlite3
+
+# Frontend build/runtime
+frontend/node_modules/
+frontend/.next/
+frontend/.turbo/
+frontend/coverage/
+frontend/.vite/
+
+# Logs/env noise
+*.log
+.env
+.env.local

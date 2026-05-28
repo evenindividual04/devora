@@ -1,0 +1,49 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - heading "Devora GitHub Profile Analyzer" [level=1] [ref=e3]
+    - paragraph [ref=e4]: "Private beta flow: login, analyze, inspect evidence, export, share."
+    - generic [ref=e6]:
+      - link "Devora" [ref=e7] [cursor=pointer]:
+        - /url: /analyze
+      - link "Analyze" [ref=e8] [cursor=pointer]:
+        - /url: /analyze
+      - link "Log in" [ref=e9] [cursor=pointer]:
+        - /url: /analyze
+    - generic [ref=e10]:
+      - generic [ref=e11]:
+        - generic [ref=e12]:
+          - heading "Analyze a GitHub Profile" [level=2] [ref=e13]
+          - button "Sign in to save history" [ref=e15] [cursor=pointer]
+        - generic [ref=e16]:
+          - textbox "GitHub username" [ref=e17]: torvalds
+          - combobox [ref=e18]:
+            - option "Authentic" [selected]
+            - option "Polished"
+            - option "Recruiter"
+            - option "Playful"
+            - option "Technical"
+            - option "Brutally Honest"
+          - button "Analyze" [ref=e23] [cursor=pointer]
+      - generic [ref=e24]:
+        - generic [ref=e25]:
+          - text: Archetype
+          - heading "OSS Maintainer" [level=2] [ref=e26]
+          - paragraph [ref=e27]: "58% confidence · also: Product Engineer, Systems Builder"
+          - paragraph [ref=e28]: "Analysis of @torvalds based on sampled repository and commit activity. Archetype: OSS Maintainer."
+          - paragraph [ref=e29]:
+            - strong [ref=e30]: "Standout repos:"
+            - code [ref=e31]: linux
+            - code [ref=e32]: uemacs
+            - code [ref=e33]: GuitarPedal
+          - list [ref=e34]:
+            - listitem [ref=e35]: Activity patterns derived from most recently updated repositories.
+            - listitem [ref=e36]: Commit semantic breakdown indicates primary engineering focus.
+        - button "▸ Signals (35)" [ref=e38] [cursor=pointer]:
+          - generic [ref=e39]: ▸
+          - text: Signals (35)
+        - generic [ref=e40]:
+          - generic [ref=e41]:
+            - heading "Generated README" [level=3] [ref=e42]
+            - button "Copy markdown" [ref=e43] [cursor=pointer]
+          - generic [ref=e44]: "# torvalds **OSS Maintainer** ## Focus - Primary language: C - Activity: 0.18 commits/week (sampled) ## Signals - `feature_ratio`: 0.212 (confidence 74%) - `fix_ratio`: 0.093 (confidence 74%) - `refactor_ratio`: 0.026 (confidence 68%) - `infra_ratio`: 0.033 (confidence 65%) - `docs_ratio`: 0.04 (confidence 62%) - `commit_message_quality`: 0.936 (confidence 60%)"
+  - alert [ref=e20]

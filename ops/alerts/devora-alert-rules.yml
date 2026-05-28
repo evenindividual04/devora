@@ -1,0 +1,26 @@
+groups:
+  - name: devora-alerts
+    rules:
+      - alert: DevoraHighFailureRate
+        expr: increase(devora_counter{name="analysis.failed"}[10m]) > 20
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High analysis failure rate"
+
+      - alert: DevoraQueueLag
+        expr: increase(devora_counter{name="analysis.queued"}[10m]) - increase(devora_counter{name="analysis.completed"}[10m]) > 50
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queue lag is growing"
+
+      - alert: DevoraOAuthExchangeSpike
+        expr: increase(devora_counter{name="oauth.exchange.failures"}[15m]) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "GitHub OAuth exchange failures spiking"

@@ -6,6 +6,8 @@ from uuid import UUID
 
 from sqlalchemy import select
 
+from app.core.cache import cache
+from app.core.config import settings
 from app.db.models import AnalysisORM
 from app.db.session import SessionLocal
 from app.models.contracts import AnalysisRecord
@@ -36,15 +38,23 @@ class AnalysisStore:
         return record
 
     async def get(self, analysis_id: UUID) -> AnalysisRecord | None:
+        key = f"analysis:{analysis_id}"
+        if (raw := await cache.get(key)) is not None:
+            return AnalysisRecord.model_validate(raw)
         async with SessionLocal() as session:
             res = await session.execute(select(AnalysisORM).where(AnalysisORM.analysis_id == str(analysis_id)))
             orm = res.scalar_one_or_none()
             if not orm:
                 return None
-            return AnalysisRecord.model_validate_json(orm.payload_json)
+            record = AnalysisRecord.model_validate_json(orm.payload_json)
+        if record.status == "completed":
+            await cache.set(key, record.model_dump(mode="json"), settings.cache_analysis_ttl)
+        return record
 
     async def update(self, record: AnalysisRecord) -> AnalysisRecord:
         record.updated_at = datetime.now(UTC)
+        key = f"analysis:{record.analysis_id}"
+        await cache.delete(key)
         async with SessionLocal() as session:
             res = await session.execute(select(AnalysisORM).where(AnalysisORM.analysis_id == str(record.analysis_id)))
             orm = res.scalar_one_or_none()
@@ -57,14 +67,26 @@ class AnalysisStore:
             orm.updated_at = record.updated_at
             orm.payload_json = record.model_dump_json()
             await session.commit()
+        if record.status == "completed":
+            await cache.set(key, record.model_dump(mode="json"), settings.cache_analysis_ttl)
         return record
 
     async def get_by_idempotency_key(self, key: str) -> AnalysisRecord | None:
+        if not key:
+            return None
         async with SessionLocal() as session:
-            res = await session.execute(select(AnalysisORM).where(AnalysisORM.idempotency_key == key))
-            orm = res.scalar_one_or_none()
-            if not orm:
+            res = await session.execute(
+                select(AnalysisORM)
+                .where(AnalysisORM.idempotency_key == key)
+                .order_by(AnalysisORM.created_at.desc())
+                .limit(5)
+            )
+            rows = res.scalars().all()
+            if not rows:
                 return None
+            # Prefer a completed record; otherwise take the most recent
+            completed = next((r for r in rows if r.status == "completed"), None)
+            orm = completed or rows[0]
             return AnalysisRecord.model_validate_json(orm.payload_json)
 
     async def list_completed(self, limit: int = 500) -> list[AnalysisRecord]:

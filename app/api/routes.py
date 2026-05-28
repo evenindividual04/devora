@@ -6,7 +6,7 @@ from urllib.parse import urlencode
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
 from app.core.config import settings
@@ -132,8 +132,12 @@ async def run_analysis(payload: AnalysisRunRequest, request: Request, user: Curr
         if existing and await owner_store.owns_analysis(str(existing.analysis_id), user.user_id):
             return AnalysisRunResponse(analysis_id=existing.analysis_id, status=existing.status)
     else:
-        idempotency_key = ""
+        # Anonymous callers always get public scope; dedupe across all anonymous callers
         payload = payload.model_copy(update={"include_private": False, "scope": DataScope.public})
+        idempotency_key = build_idempotency_key(payload)
+        existing = await store.get_by_idempotency_key(idempotency_key)
+        if existing:
+            return AnalysisRunResponse(analysis_id=existing.analysis_id, status=existing.status)
 
     needs_private = payload.include_private or payload.scope == DataScope.private
     if needs_private:
@@ -169,12 +173,16 @@ async def list_analysis(user: CurrentUser = Depends(get_current_user)):
 
 
 @analysis_router.get("/{analysis_id}")
-async def get_analysis(analysis_id: str, user: CurrentUser | None = Depends(get_optional_user)):
+async def get_analysis(analysis_id: str, response: Response, user: CurrentUser | None = Depends(get_optional_user)):
     if user and not await owner_store.owns_analysis(analysis_id, user.user_id) and user.role != "admin":
         raise HTTPException(status_code=403, detail="forbidden")
     record = await store.get(UUID(analysis_id))
     if not record:
         raise HTTPException(status_code=404, detail="analysis not found")
+    if record.status == "completed":
+        response.headers["Cache-Control"] = "public, max-age=3600"
+    else:
+        response.headers["Cache-Control"] = "no-store"
     return record.model_dump()
 
 
@@ -199,7 +207,7 @@ async def get_signals(analysis_id: str, user: CurrentUser | None = Depends(get_o
 
 
 @analysis_router.get("/{analysis_id}/readme")
-async def get_readme(analysis_id: str, user: CurrentUser | None = Depends(get_optional_user)):
+async def get_readme(analysis_id: str, response: Response, user: CurrentUser | None = Depends(get_optional_user)):
     if user and not await owner_store.owns_analysis(analysis_id, user.user_id) and user.role != "admin":
         raise HTTPException(status_code=403, detail="forbidden")
     record = await store.get(UUID(analysis_id))
@@ -207,11 +215,15 @@ async def get_readme(analysis_id: str, user: CurrentUser | None = Depends(get_op
         raise HTTPException(status_code=404, detail="analysis not found")
     if not record.readme:
         raise HTTPException(status_code=409, detail="readme not ready")
+    if record.status == "completed":
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    else:
+        response.headers["Cache-Control"] = "no-store"
     return {"analysis_id": str(record.analysis_id), **record.readme.model_dump()}
 
 
 @analysis_router.get("/{analysis_id}/report")
-async def get_report(analysis_id: str, user: CurrentUser | None = Depends(get_optional_user)):
+async def get_report(analysis_id: str, response: Response, user: CurrentUser | None = Depends(get_optional_user)):
     if user and not await owner_store.owns_analysis(analysis_id, user.user_id) and user.role != "admin":
         raise HTTPException(status_code=403, detail="forbidden")
     record = await store.get(UUID(analysis_id))
@@ -219,6 +231,10 @@ async def get_report(analysis_id: str, user: CurrentUser | None = Depends(get_op
         raise HTTPException(status_code=404, detail="analysis not found")
     if not record.report:
         raise HTTPException(status_code=409, detail="report not ready")
+    if record.status == "completed":
+        response.headers["Cache-Control"] = "public, max-age=86400"
+    else:
+        response.headers["Cache-Control"] = "no-store"
     return {"analysis_id": str(record.analysis_id), "report": record.report.model_dump(), "readme": record.readme.model_dump() if record.readme else None}
 
 

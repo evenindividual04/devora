@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     github_commits_per_repo: int = 15
     github_signal_repos: int = 5  # top repos for languages/contributors fetch
 
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    cerebras_api_key: str = ""
+    cerebras_model: str = "llama3.1-70b"
+
     eval_judge_providers: list[str] = ["deterministic"]
     eval_openai_base_url: str = ""
     eval_openai_api_key: str = ""

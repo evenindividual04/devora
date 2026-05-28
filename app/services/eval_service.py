@@ -9,7 +9,7 @@ import logging
 
 from app.core.config import settings
 from app.eval.dimensions import DIMENSIONS
-from app.eval.judges import DeterministicAuthenticityJudge, GeminiJudgeProvider, OpenAICompatibleJudgeProvider
+from app.eval.judges import CerebrasJudgeProvider, DeterministicAuthenticityJudge, GeminiJudgeProvider, GroqJudgeProvider, OpenAICompatibleJudgeProvider
 from app.models.contracts import DimensionScore, EvalResult
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ class ReadmeEvaluator:
         self._providers = providers
         self._det_judge = DeterministicAuthenticityJudge()
         self._gemini: GeminiJudgeProvider | None = None
+        self._groq: GroqJudgeProvider | None = None
+        self._cerebras: CerebrasJudgeProvider | None = None
         self._oai: OpenAICompatibleJudgeProvider | None = None
 
         if "gemini" in providers and settings.gemini_api_key:
@@ -29,6 +31,18 @@ class ReadmeEvaluator:
                 self._gemini = GeminiJudgeProvider()
             except Exception as exc:
                 logger.warning("Gemini judge init failed: %s", exc)
+
+        if "groq" in providers and settings.groq_api_key:
+            try:
+                self._groq = GroqJudgeProvider()
+            except Exception as exc:
+                logger.warning("Groq judge init failed: %s", exc)
+
+        if "cerebras" in providers and settings.cerebras_api_key:
+            try:
+                self._cerebras = CerebrasJudgeProvider()
+            except Exception as exc:
+                logger.warning("Cerebras judge init failed: %s", exc)
 
         if "openai_compatible" in providers and settings.eval_openai_api_key:
             try:
@@ -67,7 +81,25 @@ class ReadmeEvaluator:
                 except Exception as exc:
                     logger.warning("Gemini judge failed for %s: %s", dim.name, exc)
 
-            # OpenAI-compatible
+            # Groq
+            if self._groq and "groq" in self._providers:
+                try:
+                    ds = self._groq.score(dim.name, readme, signals_json)
+                    dim_scores.append(ds)
+                    used_judges.add("groq")
+                except Exception as exc:
+                    logger.warning("Groq judge failed for %s: %s", dim.name, exc)
+
+            # Cerebras
+            if self._cerebras and "cerebras" in self._providers:
+                try:
+                    ds = self._cerebras.score(dim.name, readme, signals_json)
+                    dim_scores.append(ds)
+                    used_judges.add("cerebras")
+                except Exception as exc:
+                    logger.warning("Cerebras judge failed for %s: %s", dim.name, exc)
+
+            # OpenAI-compatible (generic)
             if self._oai and "openai_compatible" in self._providers:
                 try:
                     ds = self._oai.score(dim.name, readme, signals_json)

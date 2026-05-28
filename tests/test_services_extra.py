@@ -344,6 +344,8 @@ class TestNarrativeServiceBuildProvider:
         from app.services.narrative_provider import DeterministicNarrativeProvider
         with patch("app.services.narrative_service.settings") as mock_settings:
             mock_settings.gemini_api_key = ""
+            mock_settings.groq_api_key = ""
+            mock_settings.cerebras_api_key = ""
             provider = _build_provider()
         assert isinstance(provider, DeterministicNarrativeProvider)
 

@@ -123,7 +123,7 @@ def _owns_or_public(user: CurrentUser | None, analysis_id: str) -> bool:
 
 @analysis_router.post("/run", response_model=AnalysisRunResponse)
 async def run_analysis(payload: AnalysisRunRequest, request: Request, user: CurrentUser | None = Depends(get_optional_user)) -> AnalysisRunResponse:
-    uid = user.user_id if user else request.client.host
+    uid = user.user_id if user else (request.client.host if request.client else "anon")
     rate_limiter.check(_rate_key(request, uid))
 
     if user:
@@ -380,7 +380,6 @@ async def get_eval(analysis_id: str, _user=Depends(get_optional_user)):
 @ops_router.get("/eval/summary")
 async def eval_summary(_admin: CurrentUser = Depends(require_admin)):
     """Admin: per-dimension score distribution + banned-phrase incidence."""
-    from app.eval.monitoring import population_stability_index
     from app.services.narrative_provider import _BANNED_PHRASES
     records = await store.list_completed(limit=500)
     evals = [r.eval for r in records if r.eval]

@@ -8,13 +8,11 @@ import json
 import logging
 from typing import Protocol
 
-from app.eval.dimensions import DIMENSION_MAP, DIMENSIONS
+from app.eval.dimensions import DIMENSION_MAP
 from app.models.contracts import DimensionScore
+from app.services.narrative_provider import _BANNED_PHRASES
 
 logger = logging.getLogger(__name__)
-
-# Reuse banned-phrase list from narrative provider
-from app.services.narrative_provider import _BANNED_PHRASES
 
 
 class JudgeProvider(Protocol):
@@ -34,7 +32,6 @@ class DeterministicAuthenticityJudge:
         text_lower = readme_md.lower()
         found = [p for p in _BANNED_PHRASES if p.lower() in text_lower]
 
-        # Empty README is universally bad regardless of dimension
         if not readme_md.strip():
             return DimensionScore(
                 dimension=dimension,
@@ -50,7 +47,6 @@ class DeterministicAuthenticityJudge:
                 else "No banned phrases detected."
             )
         else:
-            # Deterministic judge only judges authenticity reliably
             raw_score = max(1, 4 - len(found))
             reasoning = (
                 f"Deterministic score for {dimension}. "
@@ -70,13 +66,16 @@ class GeminiJudgeProvider:
 
     def __init__(self) -> None:
         from app.core.config import settings
+        self._available = False
         try:
             from google import genai  # type: ignore[import-untyped]
             self._client = genai.Client(api_key=settings.gemini_api_key)
             self._model_name = settings.gemini_model
             self._available = bool(settings.gemini_api_key)
-        except Exception:
-            self._available = False
+        except ImportError:
+            logger.warning("google-genai not installed; Gemini judge unavailable")
+        except Exception as exc:
+            logger.warning("Gemini judge init failed: %s", exc)
 
     def score(self, dimension: str, readme_md: str, signals_json: str) -> DimensionScore:
         if not self._available:
@@ -113,17 +112,18 @@ class GeminiJudgeProvider:
 
 
 class OpenAICompatibleJudgeProvider:
-    """OpenAI-compatible judge for cross-family diversity (Groq, OpenRouter free Llama)."""
+    """OpenAI-compatible judge. Works with Groq, Cerebras, OpenRouter, or any OpenAI-format API."""
 
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
-        self._base_url = base_url
+    def __init__(self, base_url: str, api_key: str, model: str, judge_name: str = "openai_compatible") -> None:
+        self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
+        self._judge_name = judge_name
         self._available = bool(api_key and base_url and model)
 
     def score(self, dimension: str, readme_md: str, signals_json: str) -> DimensionScore:
         if not self._available:
-            raise RuntimeError("OpenAI-compatible judge not configured")
+            raise RuntimeError(f"{self._judge_name} judge not configured")
         dim = DIMENSION_MAP.get(dimension)
         if not dim:
             raise ValueError(f"Unknown dimension: {dimension}")
@@ -150,8 +150,34 @@ class OpenAICompatibleJudgeProvider:
                     dimension=dimension,
                     score=float(max(1, min(5, data.get("score", 3)))),
                     reasoning=data.get("reasoning", ""),
-                    judge="openai_compatible",
+                    judge=self._judge_name,
                 )
         except Exception as exc:
-            logger.warning("OpenAI-compatible judge failed for %s: %s", dimension, exc)
-        return DimensionScore(dimension=dimension, score=3.0, reasoning="judge unavailable", judge="openai_compatible")
+            logger.warning("%s judge failed for %s: %s", self._judge_name, dimension, exc)
+        return DimensionScore(dimension=dimension, score=3.0, reasoning="judge unavailable", judge=self._judge_name)
+
+
+class GroqJudgeProvider(OpenAICompatibleJudgeProvider):
+    """Groq-hosted LLM judge (llama-3.3-70b-versatile by default)."""
+
+    def __init__(self) -> None:
+        from app.core.config import settings
+        super().__init__(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=settings.groq_api_key,
+            model=settings.groq_model,
+            judge_name="groq",
+        )
+
+
+class CerebrasJudgeProvider(OpenAICompatibleJudgeProvider):
+    """Cerebras-hosted LLM judge (llama3.1-70b by default)."""
+
+    def __init__(self) -> None:
+        from app.core.config import settings
+        super().__init__(
+            base_url="https://api.cerebras.ai/v1",
+            api_key=settings.cerebras_api_key,
+            model=settings.cerebras_model,
+            judge_name="cerebras",
+        )

@@ -557,6 +557,68 @@ class GeminiNarrativeProvider(NarrativeProvider):
             return self._fallback.build_both(prompt)
 
 
+# ── OpenAI-compatible provider (Groq, Cerebras, OpenRouter, …) ───────────────
+
+class OpenAICompatibleNarrativeProvider(NarrativeProvider):
+    """Narrative provider for any OpenAI-format API (Groq, Cerebras, etc.)."""
+
+    def __init__(self, base_url: str, api_key: str, model: str, provider_name: str = "openai_compatible") -> None:
+        import httpx
+        self._base_url = base_url.rstrip("/")
+        self._api_key = api_key
+        self._model = model
+        self._provider_name = provider_name
+        self._http = httpx.Client(timeout=30.0)
+        self._fallback = DeterministicNarrativeProvider()
+
+    def _generate(self, user_prompt: str) -> str:
+        resp = self._http.post(
+            f"{self._base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self._api_key}", "Content-Type": "application/json"},
+            json={
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "max_tokens": 1500,
+                "temperature": 0.7,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"] or ""
+
+    def build_both(self, prompt: NarrativePrompt) -> tuple[ReadmeResult, ReportResult]:
+        top_repos = prompt.standout_repos[:3] or [
+            ref.source_id for ref in prompt.archetype.supporting_evidence
+            if ref.source_type == "repo"
+        ][:3]
+        try:
+            raw = self._generate(_build_combined_prompt(prompt)).strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+            data = json.loads(raw)
+            markdown = anti_generic_guard(data.get("readme_markdown", ""))
+            readme = ReadmeResult(
+                markdown=markdown,
+                sections=[ReadmeSection(
+                    title="Generated Profile",
+                    content=markdown,
+                    evidence_refs=prompt.archetype.supporting_evidence,
+                )],
+            )
+            report = ReportResult(
+                summary=anti_generic_guard(data.get("summary", "")),
+                archetype=prompt.archetype,
+                standout_repos=data.get("standout_repos", top_repos),
+                timeline=data.get("timeline", []),
+            )
+            return readme, report
+        except Exception:
+            logger.exception("%s generation failed, falling back to deterministic", self._provider_name)
+            return self._fallback.build_both(prompt)
+
+
 # ── Deterministic provider ────────────────────────────────────────────────────
 
 class DeterministicNarrativeProvider(NarrativeProvider):

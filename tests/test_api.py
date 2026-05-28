@@ -7,7 +7,7 @@ from app.db.models import Base
 from app.db.session import engine
 from app.main import app
 from app.models.contracts import GitHubCommit, GitHubRepo
-from app.services.github_client import GitHubClient
+from app.services.github_client import CollaborationCounts, GitHubClient
 
 
 async def _fake_fetch_repos(self, username: str, include_private: bool = False):
@@ -33,9 +33,27 @@ async def _fake_fetch_user_pr_issue_counts(self, username: str) -> tuple[int, in
     return 5, 3
 
 
+async def _fake_fetch_user_collaboration_counts(self, username: str) -> CollaborationCounts:
+    _ = username
+    return CollaborationCounts(pr_count=5, reviewed_pr_count=2, issue_count=3, closed_issue_count=2)
+
+
+async def _fake_fetch_repo_languages(self, username: str, repo_name: str) -> dict:
+    _ = (username, repo_name)
+    return {"Python": 8000, "Shell": 2000}
+
+
+async def _fake_fetch_contributors(self, username: str, repo_name: str) -> list:
+    _ = (username, repo_name)
+    return [(username, 80), ("other", 20)]
+
+
 GitHubClient.fetch_repos = _fake_fetch_repos
 GitHubClient.fetch_commits = _fake_fetch_commits
 GitHubClient.fetch_user_pr_issue_counts = _fake_fetch_user_pr_issue_counts
+GitHubClient.fetch_user_collaboration_counts = _fake_fetch_user_collaboration_counts
+GitHubClient.fetch_repo_languages = _fake_fetch_repo_languages
+GitHubClient.fetch_contributors = _fake_fetch_contributors
 
 
 def _wait_for_completed(client: TestClient, analysis_id: str, auth: dict, timeout_seconds: float = 3.0) -> None:

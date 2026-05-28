@@ -67,6 +67,17 @@ class AnalysisStore:
                 return None
             return AnalysisRecord.model_validate_json(orm.payload_json)
 
+    async def list_completed(self, limit: int = 500) -> list[AnalysisRecord]:
+        async with SessionLocal() as session:
+            res = await session.execute(
+                select(AnalysisORM)
+                .where(AnalysisORM.status == "completed")
+                .order_by(AnalysisORM.updated_at.desc())
+                .limit(limit)
+            )
+            rows = res.scalars().all()
+            return [AnalysisRecord.model_validate_json(row.payload_json) for row in rows]
+
     async def list_failed_permanent(self, limit: int = 100) -> list[dict]:
         async with SessionLocal() as session:
             res = await session.execute(

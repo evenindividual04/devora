@@ -455,7 +455,7 @@ class TestCollaborationCounts:
         assert cc.closed_issue_count == 15
 
     @pytest.mark.asyncio
-    async def test_fetch_returns_collaboration_counts(self):
+    async def test_fetch_returns_collaboration_counts(self, restore_github_client):
         """fetch_user_collaboration_counts returns CollaborationCounts, not a tuple."""
         from unittest.mock import MagicMock
         client = GitHubClient(token="fake")
@@ -486,7 +486,7 @@ class TestCollaborationCounts:
 
 class TestFetchRepoLanguages:
     @pytest.mark.asyncio
-    async def test_returns_byte_map(self):
+    async def test_returns_byte_map(self, restore_github_client):
         from unittest.mock import MagicMock
         client = GitHubClient(token="fake")
         r = MagicMock()
@@ -496,7 +496,7 @@ class TestFetchRepoLanguages:
         assert result == {"Python": 8000, "Go": 2000}
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_error(self):
+    async def test_returns_empty_on_error(self, restore_github_client):
         client = GitHubClient(token="fake")
         client._request_with_backoff = AsyncMock(
             side_effect=httpx.HTTPStatusError("404", request=AsyncMock(), response=AsyncMock(status_code=404))
@@ -511,7 +511,7 @@ class TestFetchRepoLanguages:
 
 class TestFetchContributors:
     @pytest.mark.asyncio
-    async def test_returns_login_count_pairs(self):
+    async def test_returns_login_count_pairs(self, restore_github_client):
         from unittest.mock import MagicMock
         client = GitHubClient(token="fake")
         r = MagicMock()
@@ -524,7 +524,7 @@ class TestFetchContributors:
         assert result == [("alice", 80), ("bob", 20)]
 
     @pytest.mark.asyncio
-    async def test_returns_empty_on_error(self):
+    async def test_returns_empty_on_error(self, restore_github_client):
         client = GitHubClient(token="fake")
         client._request_with_backoff = AsyncMock(side_effect=Exception("network error"))
         result = await client.fetch_contributors("alice", "myrepo")

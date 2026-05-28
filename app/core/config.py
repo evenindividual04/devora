@@ -40,6 +40,13 @@ class Settings(BaseSettings):
 
     github_max_repos: int = 30
     github_commits_per_repo: int = 15
+    github_signal_repos: int = 5  # top repos for languages/contributors fetch
+
+    eval_judge_providers: list[str] = ["deterministic"]
+    eval_openai_base_url: str = ""
+    eval_openai_api_key: str = ""
+    eval_openai_model: str = ""
+    eval_sample_rate: float = 0.1
 
 
 settings = Settings()

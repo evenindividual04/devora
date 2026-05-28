@@ -124,6 +124,21 @@ class SharedReportResponse(BaseModel):
     readme: ReadmeResult
 
 
+class DimensionScore(BaseModel):
+    dimension: str
+    score: float = Field(ge=1, le=5)
+    reasoning: str
+    judge: str
+
+
+class EvalResult(BaseModel):
+    scores: list[DimensionScore]
+    aggregate: float
+    model_set: list[str]
+    analysis_id: UUID | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class AnalysisRecord(BaseModel):
     analysis_id: UUID = Field(default_factory=uuid4)
     username: str
@@ -141,6 +156,7 @@ class AnalysisRecord(BaseModel):
     archetype: ArchetypeResult | None = None
     readme: ReadmeResult | None = None
     report: ReportResult | None = None
+    eval: EvalResult | None = None
     meta: dict[str, Any] = Field(default_factory=dict)
 
 

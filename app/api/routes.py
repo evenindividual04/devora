@@ -356,6 +356,63 @@ async def health_ready():
     return {"status": "ready", "dependencies": {"db": db_ok, "queue": queue_ok}, "metrics": metrics.snapshot()}
 
 
+@analysis_router.get("/{analysis_id}/eval")
+async def get_eval(analysis_id: str, _user=Depends(get_optional_user)):
+    """Return cached eval for an analysis, or score on demand."""
+    record = await store.get(UUID(analysis_id))
+    if not record:
+        raise HTTPException(status_code=404, detail="analysis not found")
+    if record.eval:
+        return record.eval
+    if record.status != "completed" or not record.readme:
+        raise HTTPException(status_code=404, detail="analysis not yet completed or no readme")
+    from app.services.eval_service import get_evaluator
+    import json
+    evaluator = get_evaluator()
+    signals_json = json.dumps({s.name: s.value for s in record.signals})
+    eval_result = evaluator.evaluate(record.readme.markdown, signals_json)
+    eval_result.analysis_id = record.analysis_id
+    record.eval = eval_result
+    await store.update(record)
+    return eval_result
+
+
+@ops_router.get("/eval/summary")
+async def eval_summary(_admin: CurrentUser = Depends(require_admin)):
+    """Admin: per-dimension score distribution + banned-phrase incidence."""
+    from app.eval.monitoring import population_stability_index
+    from app.services.narrative_provider import _BANNED_PHRASES
+    records = await store.list_completed(limit=500)
+    evals = [r.eval for r in records if r.eval]
+    if not evals:
+        return {"count": 0, "dimensions": {}, "banned_phrase_incidence": 0.0}
+
+    from collections import defaultdict
+    dim_scores: dict[str, list[float]] = defaultdict(list)
+    for ev in evals:
+        for ds in ev.scores:
+            dim_scores[ds.dimension].append(ds.score)
+
+    dimension_summary = {
+        dim: {"mean": round(sum(vs) / len(vs), 3), "count": len(vs), "distribution": vs}
+        for dim, vs in dim_scores.items()
+    }
+
+    # Banned phrase incidence across all readmes
+    readmes = [r.readme.markdown for r in records if r.readme]
+    flagged = sum(
+        1 for rm in readmes
+        if any(p.lower() in rm.lower() for p in _BANNED_PHRASES)
+    )
+    incidence = flagged / max(len(readmes), 1)
+
+    return {
+        "count": len(evals),
+        "dimensions": dimension_summary,
+        "banned_phrase_incidence": round(incidence, 3),
+    }
+
+
 @ops_router.get("/metrics", response_class=PlainTextResponse)
 async def metrics_endpoint(_admin: CurrentUser = Depends(require_admin)):
     snap = metrics.snapshot()

@@ -81,7 +81,7 @@ class PipelineWorker:
             evaluator = get_evaluator()
             signals_json = json.dumps({s.name: s.value for s in record.signals})
             readme_md = record.readme.markdown if record.readme else ""
-            eval_result = evaluator.evaluate(readme_md, signals_json)
+            eval_result = await asyncio.to_thread(evaluator.evaluate, readme_md, signals_json)
             eval_result.analysis_id = record.analysis_id
             record.eval = eval_result
             await store.update(record)

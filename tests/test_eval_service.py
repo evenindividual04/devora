@@ -127,3 +127,336 @@ class TestEvalContracts:
         assert er.aggregate == 4.0
         assert er.model_set == ["deterministic"]
         assert len(er.scores) == 1
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenAICompatibleJudgeProvider + GroqJudgeProvider + CerebrasJudgeProvider
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestOpenAICompatibleJudgeProvider:
+    def test_raises_when_not_configured(self):
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+        provider = OpenAICompatibleJudgeProvider(base_url="", api_key="", model="")
+        with pytest.raises(RuntimeError):
+            provider.score("authenticity", "readme", "{}")
+
+    def test_scores_valid_json_response(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"score": 4, "reasoning": "good specificity"}'}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        import httpx
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: mock_resp)
+
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://example.com", api_key="key", model="model-x", judge_name="test"
+        )
+        result = provider.score("specificity", "Some readme.", "{}")
+        assert result.score == 4.0
+        assert result.judge == "test"
+        assert result.reasoning == "good specificity"
+
+    def test_falls_back_on_malformed_json(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "not json at all"}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        import httpx
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: mock_resp)
+
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://example.com", api_key="key", model="model-x", judge_name="test"
+        )
+        result = provider.score("authenticity", "Some readme.", "{}")
+        assert result.score == 3.0
+        assert result.reasoning == "judge unavailable"
+
+    def test_falls_back_on_http_error(self, monkeypatch):
+        import httpx
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+
+        def _raise(*a, **kw):
+            raise httpx.HTTPStatusError("500", request=MagicMock(), response=MagicMock())
+
+        monkeypatch.setattr(httpx, "post", _raise)
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://example.com", api_key="key", model="model-x"
+        )
+        result = provider.score("authenticity", "readme", "{}")
+        assert result.score == 3.0
+
+    def test_score_clamped_to_1_5(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"score": 99, "reasoning": "great"}'}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+
+        import httpx
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: mock_resp)
+
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://example.com", api_key="key", model="m"
+        )
+        result = provider.score("specificity", "readme", "{}")
+        assert result.score == 5.0
+
+
+class TestGroqAndCerebrasProviders:
+    def test_groq_provider_not_available_without_key(self):
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+        p = OpenAICompatibleJudgeProvider(
+            base_url="https://api.groq.com/openai/v1", api_key="", model="llama-3.3-70b", judge_name="groq"
+        )
+        with pytest.raises(RuntimeError, match="groq"):
+            p.score("authenticity", "readme", "{}")
+
+
+
+
+
+
+
+
+    def test_groq_judge_name_in_score(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+        import httpx
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"score": 3, "reasoning": "ok"}'}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: mock_resp)
+
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://api.groq.com/openai/v1", api_key="fake", model="llama-3.3-70b", judge_name="groq"
+        )
+        result = provider.score("authenticity", "readme", "{}")
+        assert result.judge == "groq"
+
+    def test_cerebras_judge_name_in_score(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import OpenAICompatibleJudgeProvider
+        import httpx
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": '{"score": 2, "reasoning": "weak"}'}}]
+        }
+        mock_resp.raise_for_status = MagicMock()
+        monkeypatch.setattr(httpx, "post", lambda *a, **kw: mock_resp)
+
+        provider = OpenAICompatibleJudgeProvider(
+            base_url="https://api.cerebras.ai/v1", api_key="fake", model="llama3.1-70b", judge_name="cerebras"
+        )
+        result = provider.score("specificity", "readme", "{}")
+        assert result.judge == "cerebras"
+
+
+class TestReadmeEvaluatorWithGroqCerebras:
+    def test_groq_scores_appear_in_model_set(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import GroqJudgeProvider
+
+        mock_groq = MagicMock(spec=GroqJudgeProvider)
+        mock_groq.score.return_value = DimensionScore(
+            dimension="authenticity", score=4.0, reasoning="groq ok", judge="groq"
+        )
+        monkeypatch.setattr("app.services.eval_service.GroqJudgeProvider", lambda: mock_groq)
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "eval_judge_providers": ["groq", "deterministic"],
+            "gemini_api_key": "",
+            "groq_api_key": "fake-groq-key",
+            "cerebras_api_key": "",
+            "eval_openai_api_key": "",
+        })())
+
+        from app.services.eval_service import ReadmeEvaluator
+        evaluator = ReadmeEvaluator(providers=["groq", "deterministic"])
+        evaluator._groq = mock_groq
+        result = evaluator.evaluate("Some readme.", "{}")
+        assert "groq" in result.model_set
+
+    def test_cerebras_scores_appear_in_model_set(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.eval.judges import CerebrasJudgeProvider
+
+        mock_cerebras = MagicMock(spec=CerebrasJudgeProvider)
+        mock_cerebras.score.return_value = DimensionScore(
+            dimension="authenticity", score=3.5, reasoning="cerebras ok", judge="cerebras"
+        )
+        monkeypatch.setattr("app.services.eval_service.CerebrasJudgeProvider", lambda: mock_cerebras)
+
+        from app.services.eval_service import ReadmeEvaluator
+        evaluator = ReadmeEvaluator(providers=["cerebras", "deterministic"])
+        evaluator._cerebras = mock_cerebras
+        result = evaluator.evaluate("Some readme.", "{}")
+        assert "cerebras" in result.model_set
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ReadmeEvaluator __init__ paths for groq/cerebras/openai_compatible
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestReadmeEvaluatorInit:
+    def test_groq_initialized_when_key_set(self, monkeypatch):
+        from unittest.mock import MagicMock
+        mock_groq_cls = MagicMock()
+        monkeypatch.setattr("app.services.eval_service.GroqJudgeProvider", mock_groq_cls)
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "eval_judge_providers": ["groq"],
+            "gemini_api_key": "",
+            "groq_api_key": "fake-groq",
+            "cerebras_api_key": "",
+            "eval_openai_api_key": "",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["groq"])
+        mock_groq_cls.assert_called_once()
+        assert ev._groq is not None
+
+    def test_cerebras_initialized_when_key_set(self, monkeypatch):
+        from unittest.mock import MagicMock
+        mock_cerebras_cls = MagicMock()
+        monkeypatch.setattr("app.services.eval_service.CerebrasJudgeProvider", mock_cerebras_cls)
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "eval_judge_providers": ["cerebras"],
+            "gemini_api_key": "",
+            "groq_api_key": "",
+            "cerebras_api_key": "fake-cerebras",
+            "eval_openai_api_key": "",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["cerebras"])
+        mock_cerebras_cls.assert_called_once()
+        assert ev._cerebras is not None
+
+    def test_openai_compatible_initialized_when_key_set(self, monkeypatch):
+        from unittest.mock import MagicMock
+        mock_oai_cls = MagicMock()
+        monkeypatch.setattr("app.services.eval_service.OpenAICompatibleJudgeProvider", mock_oai_cls)
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "eval_judge_providers": ["openai_compatible"],
+            "gemini_api_key": "",
+            "groq_api_key": "",
+            "cerebras_api_key": "",
+            "eval_openai_api_key": "fake-oai",
+            "eval_openai_base_url": "https://example.com",
+            "eval_openai_model": "model-x",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["openai_compatible"])
+        mock_oai_cls.assert_called_once()
+        assert ev._oai is not None
+
+    def test_groq_init_exception_logged(self, monkeypatch):
+        monkeypatch.setattr("app.services.eval_service.GroqJudgeProvider", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "gemini_api_key": "",
+            "groq_api_key": "key",
+            "cerebras_api_key": "",
+            "eval_openai_api_key": "",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["groq"])
+        assert ev._groq is None
+
+    def test_groq_and_cerebras_score_in_evaluate(self, monkeypatch):
+        """Groq and cerebras scores both appear in evaluate() output."""
+        from unittest.mock import MagicMock
+        from app.services.eval_service import ReadmeEvaluator
+
+        mock_groq = MagicMock()
+        mock_groq.score.return_value = DimensionScore(
+            dimension="authenticity", score=4.0, reasoning="groq", judge="groq"
+        )
+        mock_cerebras = MagicMock()
+        mock_cerebras.score.return_value = DimensionScore(
+            dimension="authenticity", score=3.0, reasoning="cerebras", judge="cerebras"
+        )
+
+        ev = ReadmeEvaluator(providers=["groq", "cerebras", "deterministic"])
+        ev._groq = mock_groq
+        ev._cerebras = mock_cerebras
+
+        result = ev.evaluate("Some readme text.", "{}")
+        assert "groq" in result.model_set
+        assert "cerebras" in result.model_set
+
+    def test_openai_compatible_scores_in_evaluate(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from app.services.eval_service import ReadmeEvaluator
+
+        mock_oai = MagicMock()
+        mock_oai.score.return_value = DimensionScore(
+            dimension="authenticity", score=3.5, reasoning="oai", judge="openai_compatible"
+        )
+
+        ev = ReadmeEvaluator(providers=["openai_compatible", "deterministic"])
+        ev._oai = mock_oai
+
+        result = ev.evaluate("Some readme.", "{}")
+        assert "openai_compatible" in result.model_set
+
+
+class TestReadmeEvaluatorExceptPaths:
+    def test_cerebras_init_exception_logged(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.eval_service.CerebrasJudgeProvider",
+            lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "gemini_api_key": "",
+            "groq_api_key": "",
+            "cerebras_api_key": "key",
+            "eval_openai_api_key": "",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["cerebras"])
+        assert ev._cerebras is None
+
+    def test_openai_compatible_init_exception_logged(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.services.eval_service.OpenAICompatibleJudgeProvider",
+            lambda **_: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        monkeypatch.setattr("app.services.eval_service.settings", type("S", (), {
+            "gemini_api_key": "",
+            "groq_api_key": "",
+            "cerebras_api_key": "",
+            "eval_openai_api_key": "key",
+            "eval_openai_base_url": "https://x.com",
+            "eval_openai_model": "m",
+        })())
+        from app.services.eval_service import ReadmeEvaluator
+        ev = ReadmeEvaluator(providers=["openai_compatible"])
+        assert ev._oai is None
+
+    def test_evaluate_falls_back_when_all_judges_fail(self):
+        """If all active LLM judges raise, deterministic fallback kicks in."""
+        from unittest.mock import MagicMock
+        from app.services.eval_service import ReadmeEvaluator
+
+        bad_judge = MagicMock()
+        bad_judge.score.side_effect = RuntimeError("kaboom")
+
+        ev = ReadmeEvaluator(providers=["groq", "deterministic"])
+        ev._groq = bad_judge
+        result = ev.evaluate("Some readme.", "{}")
+        assert isinstance(result, EvalResult)
+        assert result.aggregate > 0

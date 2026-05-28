@@ -708,3 +708,173 @@ class TestEdgeCaseCoverage:
             r = client.get("/test-boom-coverage-only")
             assert r.status_code == 500
             assert r.json()["detail"] == "internal server error"
+
+
+# ---------------------------------------------------------------------------
+# Eval routes: GET /analysis/{id}/eval
+# ---------------------------------------------------------------------------
+
+class TestEvalRoutes:
+    def setup_method(self):
+        _reset_db()
+
+    def test_get_eval_on_demand(self):
+        """GET /analysis/{id}/eval with no cached eval scores on demand and caches result."""
+        from app.models.contracts import DimensionScore, EvalResult
+        from app.services.eval_service import ReadmeEvaluator
+
+        mock_evaluator = MagicMock(spec=ReadmeEvaluator)
+        mock_eval = EvalResult(
+            scores=[DimensionScore(dimension="authenticity", score=4.0, reasoning="ok", judge="deterministic")],
+            aggregate=4.0,
+            model_set=["deterministic"],
+        )
+        mock_evaluator.evaluate.return_value = mock_eval
+
+        with TestClient(app) as client:
+            auth = _register_and_auth(client, "eval1@test.com")
+            uid = _get_user_id("eval1@test.com")
+            record = _completed_record("evaluser1")
+            _insert_record(record, uid)
+            aid = str(record.analysis_id)
+
+            with patch("app.services.eval_service.get_evaluator", return_value=mock_evaluator):
+                r = client.get(f"/analysis/{aid}/eval", headers=auth)
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["aggregate"] == 4.0
+        assert "deterministic" in data["model_set"]
+
+    def test_get_eval_cached(self):
+        """GET /analysis/{id}/eval with a cached eval returns it without re-scoring."""
+        from app.models.contracts import DimensionScore, EvalResult
+
+        cached_eval = EvalResult(
+            scores=[DimensionScore(dimension="authenticity", score=5.0, reasoning="cached", judge="deterministic")],
+            aggregate=5.0,
+            model_set=["deterministic"],
+        )
+
+        with TestClient(app) as client:
+            auth = _register_and_auth(client, "eval2@test.com")
+            uid = _get_user_id("eval2@test.com")
+            record = _completed_record("evaluser2")
+            record.eval = cached_eval
+            _insert_record(record, uid)
+            aid = str(record.analysis_id)
+
+            r = client.get(f"/analysis/{aid}/eval", headers=auth)
+
+        assert r.status_code == 200
+        assert r.json()["aggregate"] == 5.0
+
+    def test_get_eval_not_found(self):
+        with TestClient(app) as client:
+            auth = _register_and_auth(client, "eval3@test.com")
+            r = client.get(f"/analysis/{uuid4()}/eval", headers=auth)
+        assert r.status_code == 404
+
+    def test_get_eval_not_completed(self):
+        """Queued analysis has no readme → 404."""
+        with TestClient(app) as client:
+            auth = _register_and_auth(client, "eval4@test.com")
+            uid = _get_user_id("eval4@test.com")
+
+            from app.models.contracts import DataScope, HonestyMode, OutputTarget
+            record = AnalysisRecord(
+                username="pending",
+                scope=DataScope.public,
+                honesty_mode=HonestyMode.authentic,
+                output_targets=[OutputTarget.readme],
+                include_private=False,
+                status="queued",
+                meta={},
+            )
+            _insert_record(record, uid)
+            r = client.get(f"/analysis/{record.analysis_id}/eval", headers=auth)
+        assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Ops eval summary: GET /ops/eval/summary
+# ---------------------------------------------------------------------------
+
+class TestOpsEvalSummary:
+    def setup_method(self):
+        _reset_db()
+
+    def test_eval_summary_empty(self):
+        """No completed analyses with evals → count 0."""
+        with TestClient(app) as client:
+            admin_auth = _make_admin_auth(client)
+            r = client.get("/ops/eval/summary", headers=admin_auth)
+        assert r.status_code == 200
+        assert r.json()["count"] == 0
+
+    def test_eval_summary_with_evals(self):
+        """Completed records with evals appear in aggregated summary."""
+        from app.models.contracts import DimensionScore, EvalResult
+
+        eval_result = EvalResult(
+            scores=[DimensionScore(dimension="authenticity", score=4.0, reasoning="ok", judge="deterministic")],
+            aggregate=4.0,
+            model_set=["deterministic"],
+        )
+
+        with TestClient(app) as client:
+            admin_auth = _make_admin_auth(client)
+
+            async def _insert():
+                from app.repositories.analysis_store import store as astore
+                record = _completed_record("summaryuser")
+                record.eval = eval_result
+                await astore.create(record)
+            asyncio.run(_insert())
+
+            r = client.get("/ops/eval/summary", headers=admin_auth)
+
+        assert r.status_code == 200
+        data = r.json()
+        assert data["count"] == 1
+        assert "authenticity" in data["dimensions"]
+        assert isinstance(data["banned_phrase_incidence"], float)
+
+    def test_eval_summary_requires_admin(self):
+        with TestClient(app) as client:
+            auth = _register_and_auth(client, "nonadmin@test.com")
+            r = client.get("/ops/eval/summary", headers=auth)
+        assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Anonymous analysis run: POST /analysis/run without auth
+# ---------------------------------------------------------------------------
+
+class TestAnonymousRun:
+    def setup_method(self):
+        _reset_db()
+
+    def test_anonymous_run_strips_private(self):
+        """Anonymous POST /analysis/run with include_private=True → scope=public."""
+        mock_pipeline = AsyncMock()
+
+        async def _fake_run(record):
+            record.status = "completed"
+            return record
+
+        mock_pipeline.run = _fake_run
+
+        with patch("app.workers.pipeline.worker", mock_pipeline), \
+             patch.object(GitHubClient, "fetch_repos", new=AsyncMock(return_value=[])), \
+             patch.object(GitHubClient, "fetch_commits", new=AsyncMock(return_value=[])):
+            with TestClient(app) as client:
+                r = client.post("/analysis/run", json={
+                    "username": "torvalds",
+                    "include_private": True,
+                    "honesty_mode": "authentic",
+                    "output_targets": ["readme"],
+                })
+        assert r.status_code == 200
+        data = r.json()
+        assert "analysis_id" in data

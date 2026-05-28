@@ -366,11 +366,12 @@ async def get_eval(analysis_id: str, _user=Depends(get_optional_user)):
         return record.eval
     if record.status != "completed" or not record.readme:
         raise HTTPException(status_code=404, detail="analysis not yet completed or no readme")
-    from app.services.eval_service import get_evaluator
+    import asyncio
     import json
+    from app.services.eval_service import get_evaluator
     evaluator = get_evaluator()
     signals_json = json.dumps({s.name: s.value for s in record.signals})
-    eval_result = evaluator.evaluate(record.readme.markdown, signals_json)
+    eval_result = await asyncio.to_thread(evaluator.evaluate, record.readme.markdown, signals_json)
     eval_result.analysis_id = record.analysis_id
     record.eval = eval_result
     await store.update(record)

@@ -104,7 +104,10 @@ When `test_api.py` patches `GitHubClient` methods at module load time, `conftest
 ### AsyncMock in test_api.py: don't use `new_callable=AsyncMock` with `patch.object`
 The pattern `patch.object(client, method, new_callable=AsyncMock)` combined with `side_effect=[AsyncMock(), ...]` produces unawaited coroutine warnings and wrong values. Use direct assignment instead: `client.method = AsyncMock(side_effect=[...])` with `MagicMock()` (not AsyncMock) for response objects.
 
-### GitHub languages/contributors fetch: cap to `github_signal_repos` (default 5)
+### `github_max_repos`/`github_commits_per_repo` cost tradeoff
+These two settings drive the bulk of API call volume. At defaults (30 repos × 15 commits = up to 450 commit-detail calls per analysis). Raising `github_max_repos` beyond 30 hits the secondary rate limit quickly for unauthenticated requests; raising `github_commits_per_repo` beyond 15 improves temporal signal accuracy but adds latency with diminishing returns (the 16th–30th commit per repo rarely shifts the trajectory buckets). Tune both together — doubling one without the other gives lopsided coverage (many repos shallow vs few repos deep).
+
+### `github_signal_repos` cost tradeoff: cap to `github_signal_repos` (default 5)
 Fetching languages and contributor data per repo makes 2 API calls per repo. With `github_signal_repos=5`, that's 10 extra calls per analysis. This is bounded and safe; don't increase without considering rate-limit budget (30 search-API calls + 10 signal calls = 40/analysis on authenticated requests).
 
 ### Deterministic judge: empty README scores 1/5, not 5/5

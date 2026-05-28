@@ -1,19 +1,36 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
 import time
 
+from app.core.cache import cache
 from app.core.config import settings
 from app.core.metrics import metrics
-from app.models.contracts import AnalysisRecord
+from app.models.contracts import AnalysisRecord, ArchetypeResult, HonestyMode, ReadmeResult, ReportResult, Signal
 from app.repositories.analysis_store import store
 from app.repositories.oauth_store import oauth_store
 from app.services.analysis_service import AnalysisService
 from app.services.github_client import GitHubClient
+from app.services.narrative_provider import RepoCard
 from app.services.narrative_service import NarrativeService
+
+
+def _narrative_cache_key(
+    username: str,
+    honesty_mode: HonestyMode,
+    signals: list[Signal],
+    archetype: ArchetypeResult,
+) -> str:
+    signals_fp = json.dumps(
+        sorted([{"n": s.name, "v": s.value} for s in signals], key=lambda x: x["n"]),
+        default=str,
+    )
+    raw = f"{username}:{honesty_mode.value}:{signals_fp}:{archetype.top_archetype}:{archetype.confidence:.2f}"
+    return "narrative:" + hashlib.sha256(raw.encode()).hexdigest()[:24]
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +64,8 @@ class PipelineWorker:
         record.status = "analyzing"
         await store.update(record)
 
-        signals, archetype, standout_repos = self.analysis.compute_signals(
+        signals, archetype, standout_repos = await asyncio.to_thread(
+            self.analysis.compute_signals,
             repos, commits,
             pr_count=collab.pr_count,
             issue_count=collab.issue_count,
@@ -57,7 +75,33 @@ class PipelineWorker:
             contributors=contributors or None,
             username=record.username,
         )
-        readme, report = self.narrative.build_both(record.username, record.honesty_mode, signals, archetype, standout_repos)
+        # Build repo cards for the narrative (standout repos with descriptions)
+        repo_map = {r.name: r for r in repos}
+        repo_details = [
+            RepoCard(
+                name=name,
+                description=repo_map[name].description or "",
+                language=repo_map[name].language,
+                stars=repo_map[name].stars,
+            )
+            for name in standout_repos
+            if name in repo_map
+        ]
+
+        narrative_key = _narrative_cache_key(record.username, record.honesty_mode, signals, archetype)
+        cached_narrative = await cache.get(narrative_key)
+        if cached_narrative:
+            readme = ReadmeResult.model_validate(cached_narrative["readme"])
+            report = ReportResult.model_validate(cached_narrative["report"])
+        else:
+            readme, report = await asyncio.to_thread(
+                self.narrative.build_both,
+                record.username, record.honesty_mode, signals, archetype, standout_repos, repo_details,
+            )
+            await cache.set(narrative_key, {
+                "readme": readme.model_dump(mode="json"),
+                "report": report.model_dump(mode="json"),
+            }, settings.cache_narrative_ttl)
 
         record.signals = signals
         record.archetype = archetype

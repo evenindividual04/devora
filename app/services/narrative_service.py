@@ -4,7 +4,7 @@ import logging
 
 from app.core.config import settings
 from app.models.contracts import ArchetypeResult, HonestyMode, ReadmeResult, ReportResult, Signal
-from app.services.narrative_provider import DeterministicNarrativeProvider, GeminiNarrativeProvider, NarrativePrompt, NarrativeProvider, OpenAICompatibleNarrativeProvider
+from app.services.narrative_provider import DeterministicNarrativeProvider, GeminiNarrativeProvider, NarrativePrompt, NarrativeProvider, OpenAICompatibleNarrativeProvider, RepoCard
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,8 @@ class NarrativeService:
     def __init__(self) -> None:
         self.provider = _build_provider()
 
-    def _prompt(self, username: str, honesty_mode: HonestyMode, signals: list[Signal], archetype: ArchetypeResult, standout_repos: list[str]) -> NarrativePrompt:
-        return NarrativePrompt(username=username, honesty_mode=honesty_mode, signals=signals, archetype=archetype, standout_repos=standout_repos)
+    def _prompt(self, username: str, honesty_mode: HonestyMode, signals: list[Signal], archetype: ArchetypeResult, standout_repos: list[str], repo_details: list[RepoCard] | None = None) -> NarrativePrompt:
+        return NarrativePrompt(username=username, honesty_mode=honesty_mode, signals=signals, archetype=archetype, standout_repos=standout_repos, repo_details=repo_details or [])
 
-    def build_both(self, username: str, honesty_mode: HonestyMode, signals: list[Signal], archetype: ArchetypeResult, standout_repos: list[str]) -> tuple[ReadmeResult, ReportResult]:
-        return self.provider.build_both(self._prompt(username, honesty_mode, signals, archetype, standout_repos))
+    def build_both(self, username: str, honesty_mode: HonestyMode, signals: list[Signal], archetype: ArchetypeResult, standout_repos: list[str], repo_details: list[RepoCard] | None = None) -> tuple[ReadmeResult, ReportResult]:
+        return self.provider.build_both(self._prompt(username, honesty_mode, signals, archetype, standout_repos, repo_details))

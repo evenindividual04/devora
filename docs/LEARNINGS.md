@@ -66,8 +66,23 @@ For `brutally_honest` mode, a system prompt saying "be direct" is insufficient �
 ### Anti-genericity needs both system prompt AND post-generation strip
 System prompt alone isn't sufficient — the model occasionally substitutes synonyms ("dedicated" instead of "driven"). The post-generation `anti_generic_guard()` strip catches literal phrases. Future improvement: add a validation pass asking the model to score its own output for genericity.
 
-### Fallback to deterministic on any exception — monitor it
-`GeminiNarrativeProvider` wraps both `build_readme` and `build_report` in try/except and falls back silently. A network error, quota hit, or bad response degrades rather than fails. The log says `"Gemini readme generation failed, falling back to deterministic"` — make sure this is monitored in prod.
+### Fallback to deterministic on any exception — now observable
+`GeminiNarrativeProvider` catches all exceptions and falls back to the deterministic provider. Now logs at WARNING (not debug) with the reason. `ReadmeResult.generator` is set to the model id on success or `"deterministic"` on fallback — surfaced in the API response and the UI caption. If you see `deterministic fallback` in the UI, check logs for the cause.
+
+### Silent LLM fallback root cause: markdown-in-JSON-string
+Gemini Flash (2.0-flash-lite) was generating invalid JSON when the prompt asked for a full README markdown inside a JSON string field — the markdown contained quotes, curly braces, and newlines that broke JSON parsing. Fix: add `response_schema=_NARRATIVE_JSON_SCHEMA` to `GenerateContentConfig`. With a schema, the SDK enforces field structure at the protocol level before returning text, eliminating parse failures. Upgrade to `gemini-2.5-flash` which handles structured output more reliably.
+
+### Archetype names must match template keys exactly
+The scorer's `scores` dict keys must exactly match keys in `_ARCHETYPE_TEMPLATES`. A mismatch causes silent fallback to `_DEFAULT_TEMPLATE` — the archetype is shown correctly in the headline but the narrative framing is generic. Maintain a test that asserts every emitted archetype has a template entry.
+
+### Confidence math: top/sum across N archetypes is structurally weak
+With 8 archetypes, `top_score / sum(scores)` has a minimum of 1/8 ≈ 0.125, floored at 0.40. This makes the confidence metric meaningless — every analysis shows 40–92% regardless of how clearly the data points to one archetype. Use separation-based `top/(top+second)` instead, which measures how decisively the winner beats second place: 0.9 means the winner has 9× the score of second. Cap at 0.95; apply a thin-data cap when <3 own repos or <5 commits.
+
+### Classifier "toy" label was dismissive
+Calling repos "toy" in signals like `toy_repo_count` and `dominant_repo_type` let that language leak into the narrative ("24 toy repos"). Renamed to "personal" (neutral). Added a "project" tier for repos that have ≥5 commits and a description — these are substantive personal projects that deserve a higher signal score than unstarred repos.
+
+### Churn mean+cap masks real patterns
+`avg_churn_per_commit = min(mean(churns), 2000)` was unreliable: one massive merge commit (10k+ lines) inflates the mean, and the 2000 cap makes large-commit developers look identical. Fix: use `statistics.median` on human+source-touching commits (bots and doc-only commits excluded). Median is robust to outliers and bots. Drop the cap — if a developer genuinely lands 5000-line commits, that's a real signal.
 
 ### HonestyMode instructions: write them in first person for the model
 "Write authentically" is weaker than "Write from the signals as they are — no editorialising, no softening." The model responds better to concrete behavioural instructions than abstract adjectives.
@@ -118,3 +133,28 @@ The population_stability_index function accepts both raw counts and proportions.
 
 ### `google.generativeai` is deprecated — use `google.genai`
 All new Gemini code should use `from google import genai; client = genai.Client(api_key=...)` pattern. The old `import google.generativeai as genai; genai.GenerativeModel(...)` pattern still works but emits a FutureWarning and will be removed. Narrative provider already uses the new SDK; eval judges now match.
+
+---
+
+## Caching
+
+### Never pass async Redis clients across event loop boundaries
+`redis.asyncio.Redis` is bound to the event loop it was created in. If you call `asyncio.run()` inside a thread that was spun up by `asyncio.to_thread()`, a new event loop is created — but the existing Redis client was bound to the outer loop and will error or deadlock. The fix: perform all cache I/O in the async context *before* dispatching to `to_thread`. In `pipeline.py`, the narrative cache check (`await cache.get(key)`) happens before `asyncio.to_thread(build_both, ...)` — never inside the thread.
+
+### Cache the right abstraction level: network boundary > function boundary
+Putting the cache at the HTTP client level (inside `GitHubClient`) is far more valuable than caching inside `compute_signals()`. The former eliminates network calls entirely; the latter only saves CPU. Cache as close to the external I/O as possible.
+
+### Signal fingerprint must be sorted for stable cache keys
+`_narrative_cache_key` sorts signals by name before hashing: `sorted([{"n": s.name, ...} for s in signals], key=lambda x: x["n"])`. Signal order from `compute_signals` isn't guaranteed to be stable if the underlying dict iteration order changes or signals are conditionally appended. Sort before hashing; otherwise two identical analyses can produce different cache keys.
+
+### Write-through + invalidate-before-write on analysis records
+The pattern in `AnalysisStore.update()` is: `await cache.delete(key)` → DB write → `await cache.set(key, ...)` only if `status == "completed"`. The delete happens *before* the DB write so a concurrent reader can't serve stale cached data during the write window. In-progress records are never cached — polling clients always get fresh status from the DB.
+
+### `RedisCache` lazy connect: first-call ping determines availability
+The cache class attempts `Redis.from_url(...).ping()` on the first `get`/`set` call. If Redis is down, `self._redis` stays `None` and every subsequent call is a no-op (no exception, no retry). This is intentional: the cache is an optimisation, not a correctness dependency. The downside is that a Redis restart isn't picked up automatically — `cache.close()` resets `_redis = None` so the next call will re-probe.
+
+### HTTP `Cache-Control` headers: inject via `Response` parameter, not middleware
+FastAPI's dependency injection pattern (`async def handler(response: Response, ...)`) is the cleanest way to set response headers on a per-route basis without touching the return type. Middleware-based cache headers are harder to make conditional (e.g. "only cache if status==completed"). Use the `Response` parameter injection for anything that depends on the response content.
+
+### `fetch_commits` cache key uses `username:include_private`, not repo list
+Caching commits by hashing the full repo list would be correct but produces huge keys and defeats the point (you'd need to fetch repos first to build the key). In practice, `pipeline.py` always calls `fetch_repos` (which is also cached) then passes the full list to `fetch_commits` — the two calls are always consistent within a TTL window. Only consider a finer-grained key if there's a caller that passes custom subsets.

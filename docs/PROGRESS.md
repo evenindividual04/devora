@@ -87,23 +87,59 @@ Key config flags: `RUN_WORKER_IN_API=true` (dev embeds worker), `USE_REDIS_QUEUE
 
 ---
 
+## Session 2026-05-29 — Signals + Eval Harness (feat/signals-eval-fidelity)
+
+### Area A — High-value signals (all implemented)
+- [x] `pr_review_ratio` = reviewed PRs / (authored+1) — doc rank #1 Very High
+- [x] `authorship_dominance` — avg user commit share over top repos (DOA proxy) — rank #2 Very High
+- [x] `language_entropy` — byte-weighted Shannon H — rank #6 High
+- [x] `weekday_commit_ratio` — % commits Mon–Fri — rank #7 High
+- [x] `issue_resolution_rate` = closed / (opened+1) — rank #9 Medium
+- [x] `human_commit_ratio` — after bot filtering
+- [x] Archetype scorer updated: review_bonus + dominance_bonus → OSS Maintainer; weekday_commit_ratio → Product Engineer / Hobbyist; entropy → Full-stack Generalist / Hobbyist
+
+### Area B — Data-collection fidelity (REST heuristics)
+- [x] `GitHubCommit` enriched: `author_login`, `author_date`, `committer_date`, `file_names`
+- [x] `fetch_commits` populates all new fields from commit-detail response
+- [x] Bot filter: `*[bot]`, `dependabot`, `github-actions`, `renovate` → excluded from ratios
+- [x] Trivial commit flag: `_touches_source()` — only `.py`/`.go` etc count; `.md`/`.yml`/`.lock` don't
+- [x] Backdating heuristic: `backdated_commit_ratio` when `|committer_date − author_date| > 30d`
+- [x] `fetch_user_pr_issue_counts` → deprecated wrapper over `fetch_user_collaboration_counts` (returns `CollaborationCounts` dataclass with 4 fields)
+- [x] `fetch_repo_languages(username, repo)` → `dict[str, int]` byte map
+- [x] `fetch_contributors(username, repo)` → `list[(login, contributions)]`
+- [x] Config: `github_signal_repos: int = 5`
+- [x] Pipeline wired: repo languages + contributors fetched for top-N own repos
+
+### Area C — LLM-as-Judge eval harness (full)
+- [x] `app/eval/dimensions.py` — 6 dimensions (specificity, authenticity, falsifiability, tonal_appropriateness, structural_coherence, noise_to_signal) with 1-5 rubrics + CoT prompts
+- [x] `app/eval/judges.py` — `DeterministicAuthenticityJudge` (always-on, offline-safe), `GeminiJudgeProvider` (google.genai pattern), `OpenAICompatibleJudgeProvider` (Groq/OpenRouter)
+- [x] `app/services/eval_service.py` — `ReadmeEvaluator`: panel aggregation, graceful fallback to deterministic
+- [x] `app/eval/monitoring.py` — `population_stability_index` (+0.01 empty-bin guard), `ks_statistic`
+- [x] Contracts: `DimensionScore`, `EvalResult` added to `contracts.py`; `AnalysisRecord.eval` field added
+- [x] `GET /analysis/{id}/eval` — returns cached or on-demand eval
+- [x] `GET /ops/eval/summary` — admin: per-dimension distribution + PSI + banned-phrase incidence
+- [x] Async sampling in pipeline: `eval_sample_rate` (default 0.1) triggers `asyncio.create_task`
+- [x] Config: `eval_judge_providers`, `eval_openai_*`, `eval_sample_rate`
+
+### Tests
+- 288 passed, 5 skipped (Gemini canary — rate limited, expected)
+- `tests/test_analysis_signals.py` — 46 tests (new: bot filter, trivial commit, backdating, weekday, entropy, PR review ratio, DOA, issue resolution, CollaborationCounts, fetch_repo_languages, fetch_contributors)
+- `tests/test_eval_monitoring.py` — PSI/K-S math
+- `tests/test_eval_service.py` — deterministic judge, aggregation, contracts
+- `tests/eval/test_canary.py` — 5 fixtures (good/mediocre/bad), skips when Gemini rate-limited
+- Overall coverage: 92%
+
 ## What's Next
 
 ### Priority order
 
-1. **Unit tests for AnalysisService** — currently only the API layer is tested. The signal engine now has 36+ signals and several interacting classifiers with no isolation tests. Add `tests/test_analysis_service.py` covering: `_classify_repo`, `_score_repo`, trajectory computation, archetype scoring edge cases.
+1. **Archetype calibration** — weights hand-tuned; track distribution across real users via `GET /ops/eval/summary`.
 
-2. **Repo classification: description-based signals** — `description` field is now fetched but `_classify_repo` only uses name + topics. Description text (e.g. "A machine learning experiment reproducing...") could improve classification accuracy significantly.
+2. **Frontend: signals panel** — expose `pr_review_ratio`, `language_entropy`, `weekday_commit_ratio` in `ResultsPanel`. The endpoint exists.
 
-3. **GitHub client: pagination** — `fetch_repos` fetches `per_page=100` but doesn't paginate. Users with >100 repos silently get the first 100 only. Add Link-header pagination.
+3. **Phase 2: GraphQL migration** — see `docs/PHASE2_GRAPHQL.md` for the complete plan.
 
-4. **Frontend: signals panel** — `ResultsPanel` shows archetype + README but not the signal breakdown. A collapsible signals table (name / value / confidence) would make the product inspectable. The `/analysis/{id}/signals` endpoint already exists.
-
-5. **Frontend: auth flow** — the analyze page works unauthenticated (server returns 401 or the worker fails). The `LoginForm` component exists but isn't surfaced. Wire it up so unauthenticated requests redirect to login.
-
-6. **Archetype calibration** — the confidence formula (`top_score / sum(scores)`) produces a floor of 0.40 even when only one archetype fires. Needs real user data to tune weights. Track the distribution of top archetypes to detect drift.
-
-7. **Evolution signals: language timeline per repo** — current language shift uses `repo.updated_at` as a proxy for "recent". For higher accuracy, fetch the languages breakdown per repo (`GET /repos/{owner}/{repo}/languages`) to get line-count weighted language data.
+4. **OpenAI-compatible judge** — wire Groq/OpenRouter free Llama for cross-family diversity by setting `eval_openai_*` env vars.
 
 ---
 

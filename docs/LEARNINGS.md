@@ -97,3 +97,21 @@ The test file monkey-patches `GitHubClient` methods. When you change a method si
 
 ### CI requires Postgres + Redis
 Local dev defaults to SQLite + in-memory queue (`USE_REDIS_QUEUE=false`). Don't assume local behaviour matches CI for anything queue- or DB-related.
+
+### `restore_github_client` fixture must save/restore current state, not original
+When `test_api.py` patches `GitHubClient` methods at module load time, `conftest.py` captures the originals before the patch. If `restore_github_client` restores originals and then yields, the real methods are live for the test. But on teardown it must restore the *current* (patched by test_api.py) state, not the originals — otherwise subsequent `test_api.py` tests run with the real (unpatched) methods. The fixture now saves-current → restores-original → yield → restores-saved.
+
+### AsyncMock in test_api.py: don't use `new_callable=AsyncMock` with `patch.object`
+The pattern `patch.object(client, method, new_callable=AsyncMock)` combined with `side_effect=[AsyncMock(), ...]` produces unawaited coroutine warnings and wrong values. Use direct assignment instead: `client.method = AsyncMock(side_effect=[...])` with `MagicMock()` (not AsyncMock) for response objects.
+
+### GitHub languages/contributors fetch: cap to `github_signal_repos` (default 5)
+Fetching languages and contributor data per repo makes 2 API calls per repo. With `github_signal_repos=5`, that's 10 extra calls per analysis. This is bounded and safe; don't increase without considering rate-limit budget (30 search-API calls + 10 signal calls = 40/analysis on authenticated requests).
+
+### Deterministic judge: empty README scores 1/5, not 5/5
+An empty README has no banned phrases, so a naive "penalise phrases" judge would score it 5/5. The fix: check `readme_md.strip()` first and return score=1 immediately. Always test the empty-input case for quality judges.
+
+### PSI formula: normalise inputs before applying
+The population_stability_index function accepts both raw counts and proportions. Normalise by dividing by the total in each distribution before applying the formula. Without normalisation, count-scale differences (e.g. 100 vs 0.25) produce meaningless PSI values.
+
+### `google.generativeai` is deprecated — use `google.genai`
+All new Gemini code should use `from google import genai; client = genai.Client(api_key=...)` pattern. The old `import google.generativeai as genai; genai.GenerativeModel(...)` pattern still works but emits a FutureWarning and will be removed. Narrative provider already uses the new SDK; eval judges now match.
